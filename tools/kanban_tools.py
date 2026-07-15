@@ -872,7 +872,7 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_path = args.get("workspace_path")
     branch_name = args.get("branch_name")
     project_id = args.get("project") or args.get("project_id")
-    _inherit_workspace = workspace_kind is None and workspace_path is None
+    _inherit_workspace = workspace_kind is None and workspace_path is None and branch_name is None
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")

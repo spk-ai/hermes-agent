@@ -1096,6 +1096,31 @@ def test_create_explicit_worktree_branch_beats_dir_inheritance(monkeypatch, work
         conn.close()
 
 
+def test_create_branch_only_is_not_overwritten_by_parent_inheritance(monkeypatch, worker_env):
+    """A supplied branch is explicit and must not silently become the parent's branch."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        self_tid = kb.create_task(
+            conn, title="worktree worker", assignee="test-worker",
+            workspace_kind="worktree", workspace_path="/home/teknium/proj",
+            branch_name="feature/parent",
+        )
+        kb.claim_task(conn, self_tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", self_tid)
+
+    d = json.loads(kt._handle_create({
+        "title": "bad branch-only child", "assignee": "research",
+        "branch_name": "research/requested",
+    }))
+    assert "error" in d
+    assert "branch_name" in d["error"]
+
+
 def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
     """Orchestrator/CLI callers (no HERMES_KANBAN_TASK) still default to
     scratch — inheritance only applies to task-scoped workers."""
