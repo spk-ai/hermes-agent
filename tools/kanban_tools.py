@@ -870,6 +870,7 @@ def _handle_create(args: dict, **kw) -> str:
     # fall back to scratch as before. Explicit None path stays None.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    branch_name = args.get("branch_name")
     project_id = args.get("project") or args.get("project_id")
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
@@ -911,6 +912,7 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.workspace_kind:
                         workspace_kind = _self_task.workspace_kind
                         workspace_path = _self_task.workspace_path
+                        branch_name = _self_task.branch_name
                         # Keep follow-up children inside the same project so the
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
@@ -925,6 +927,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                branch_name=branch_name,
                 project_id=project_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
@@ -1470,6 +1473,10 @@ KANBAN_CREATE_SCHEMA = {
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
                 ),
+            },
+            "branch_name": {
+                "type": "string",
+                "description": "Git branch for a worktree child. Requires workspace_kind='worktree'.",
             },
             "project": {
                 "type": "string",

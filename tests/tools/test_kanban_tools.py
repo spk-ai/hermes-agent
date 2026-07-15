@@ -1063,6 +1063,39 @@ def test_create_explicit_workspace_beats_inheritance(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_explicit_worktree_branch_beats_dir_inheritance(monkeypatch, worker_env):
+    """A report-only child can request a clean branch instead of dirty dir inheritance."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        self_tid = kb.create_task(
+            conn, title="dir worker", assignee="test-worker",
+            workspace_kind="dir", workspace_path="/home/teknium/proj",
+        )
+        kb.claim_task(conn, self_tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", self_tid)
+
+    d = json.loads(kt._handle_create({
+        "title": "isolated report", "assignee": "research",
+        "workspace_kind": "worktree",
+        "workspace_path": "/home/teknium/proj",
+        "branch_name": "research/isolated-report",
+    }))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.workspace_kind == "worktree"
+        assert child.workspace_path == "/home/teknium/proj"
+        assert child.branch_name == "research/isolated-report"
+    finally:
+        conn.close()
+
+
 def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
     """Orchestrator/CLI callers (no HERMES_KANBAN_TASK) still default to
     scratch — inheritance only applies to task-scoped workers."""
