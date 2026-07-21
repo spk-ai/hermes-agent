@@ -149,7 +149,7 @@ def test_dashboard_direct_status_and_link_refuse_strict_route_candidates(client)
         "request_id": "dashboard-direct-controls",
         "route": {
             "governing_board": "default",
-            "governing_source_id": "dashboard-detector",
+            "governing_source_id": "dashboard",
             "root_task_id": "dashboard-root",
             "route_revision": "1",
             "requirements_digest": "digest",
