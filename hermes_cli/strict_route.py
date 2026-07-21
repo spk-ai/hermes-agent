@@ -298,6 +298,83 @@ def _candidate_receipt_kinds(conn, candidate) -> set[str]:
     }
 
 
+def _candidate_receipts(conn, candidate, *, purpose: str) -> dict[str, list[dict]]:
+    """Return every receipt bound to one candidate purpose, grouped by kind.
+
+    Strict-route evidence is deliberately not a set: accepting two receipts of
+    the same kind would let a stale or conflicting witness qualify a candidate.
+    Currentness checks therefore use this helper rather than the historical
+    ``_candidate_receipt_kinds`` set projection.
+    """
+    grouped: dict[str, list[dict]] = {}
+    for row in conn.execute(
+        "SELECT r.kind, r.digest, r.payload FROM strict_route_receipts r "
+        "JOIN strict_route_candidate_receipts b ON b.receipt_pk=r.receipt_pk "
+        "WHERE b.candidate_id=? AND b.purpose=?",
+        (candidate["candidate_id"], purpose),
+    ):
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        grouped.setdefault(row["kind"], []).append({
+            "digest": row["digest"], "payload": payload,
+        })
+    return grouped
+
+
+def _exact_receipt_floor(
+    conn, candidate, required: tuple[str, ...] | frozenset[str], *, purpose: str,
+) -> tuple[Optional[str], tuple[str, ...]]:
+    """Validate exact-one, digest-authenticated immutable receipt bindings."""
+    grouped = _candidate_receipts(conn, candidate, purpose=purpose)
+    missing = tuple(kind for kind in required if len(grouped.get(kind, [])) == 0)
+    if missing:
+        return "MISSING_RECEIPT", missing
+    duplicated = tuple(kind for kind in required if len(grouped.get(kind, [])) != 1)
+    if duplicated:
+        return "RECEIPT_CARDINALITY_INVALID", duplicated
+    for kind in required:
+        receipt = grouped[kind][0]
+        if receipt["digest"] != _receipt_digest(receipt["payload"]):
+            return "RECEIPT_MISMATCH", (kind,)
+    return None, ()
+
+
+def _strict_identity_refusal(conn, candidate) -> Optional[str]:
+    """Check the immutable route/source/root/risk association boundary.
+
+    The association table is authoritative for non-scheduling facts.  It is
+    intentionally checked at every strict lifecycle ingress, so a malformed
+    migration or direct SQLite mutation cannot turn a generic task-link into
+    strict-route authorization.
+    """
+    route = conn.execute(
+        "SELECT r.route_id, r.board_slug, r.governing_source_id, r.root_task_id, "
+        "v.requirements_digest, v.risk_digest FROM strict_routes r "
+        "JOIN strict_route_revisions v ON v.route_id=r.route_id "
+        "WHERE v.revision_id=?",
+        (candidate["revision_id"],),
+    ).fetchone()
+    if route is None or not route["board_slug"] or not route["governing_source_id"] or not route["root_task_id"]:
+        return "SOURCE_OR_ROOT_MISMATCH"
+    expected = {
+        ("route", route["route_id"], "governing_source", "source", route["governing_source_id"]),
+        ("route", route["route_id"], "root_task", "task", route["root_task_id"]),
+        ("route", route["route_id"], "requirements_digest", "digest", route["requirements_digest"]),
+        ("route", route["route_id"], "risk_digest", "digest", route["risk_digest"]),
+    }
+    rows = {
+        (row["subject_type"], row["subject_id"], row["kind"], row["target_type"], row["target_id"])
+        for row in conn.execute(
+            "SELECT subject_type, subject_id, kind, target_type, target_id "
+            "FROM strict_route_associations WHERE revision_id=?",
+            (candidate["revision_id"],),
+        )
+    }
+    return None if expected <= rows else "SOURCE_OR_ROOT_MISMATCH"
+
+
 def _validate_immutable_binding(conn, candidate, kind: str, payload: Any, *, purpose: str) -> Optional[str]:
     """Reject attempts to replace evidence already bound for this purpose."""
     digests = {
@@ -511,6 +588,54 @@ def record_strict_route_receipt(conn, request: dict, *, board: Optional[str] = N
         return StrictEligibilityResult(True, "record_receipt", True, candidate["route_id"], candidate["candidate_id"], request["task_id"])
 
 
+def persist_runtime_manifest(conn, task_id: str, manifest: dict) -> StrictEligibilityResult:
+    """Bind one gateway-observed, non-secret runtime manifest to rollout.
+
+    This is deliberately a native ledger write rather than a watcher-local
+    cache: the gateway observes loaded bytes, while this function retains the
+    existing DB as the sole currentness/authority decision point.  An already
+    bound identical manifest is idempotent; a changed manifest is refused as
+    immutable evidence rather than silently replacing the load boundary.
+    """
+    from hermes_cli import kanban_db as kb
+
+    if not isinstance(manifest, dict) or not manifest.get("schema_version"):
+        return StrictEligibilityResult(False, "runtime_manifest", True, task_id=task_id, reason_code="MISSING_FIELD")
+    with kb.write_txn(conn):
+        candidate = _candidate_row(conn, task_id)
+        if candidate is None or candidate["stage_kind"] != "rollout":
+            return StrictEligibilityResult(False, "runtime_manifest", bool(candidate), task_id=task_id, reason_code="OPERATION_NOT_ALLOWED")
+        authorization = _active_candidate_authorization(conn, candidate, task_id, "runtime_manifest")
+        if authorization is not None:
+            return authorization
+        authority_code, authority_missing = _exact_receipt_floor(
+            conn, candidate, ("rollout_authority",), purpose="rollout_authority",
+        )
+        if authority_code:
+            return StrictEligibilityResult(False, "runtime_manifest", True, candidate["route_id"], candidate["candidate_id"], task_id, "ROLLOUT_AUTHORITY_REQUIRED", authority_missing)
+        identity_refusal = _strict_identity_refusal(conn, candidate)
+        if identity_refusal:
+            return StrictEligibilityResult(False, "runtime_manifest", True, candidate["route_id"], candidate["candidate_id"], task_id, identity_refusal)
+        manifest = dict(manifest)
+        manifest.update({
+            "schema_version": SCHEMA_VERSION,
+            "route_id": candidate["route_id"],
+            "route_revision": candidate["route_revision"],
+            "task_id": task_id,
+        })
+        refusal_code = _validate_immutable_binding(
+            conn, candidate, "runtime_manifest", manifest, purpose="runtime_manifest",
+        )
+        if refusal_code:
+            return StrictEligibilityResult(False, "runtime_manifest", True, candidate["route_id"], candidate["candidate_id"], task_id, refusal_code)
+        _bind_receipt(conn, candidate, "runtime_manifest", manifest, purpose="runtime_manifest")
+        kb._append_event(conn, task_id, "strict_route_runtime_manifest_recorded", {
+            "route_id": candidate["route_id"], "candidate_id": candidate["candidate_id"],
+            "manifest_digest": _receipt_digest(manifest),
+        })
+        return StrictEligibilityResult(True, "runtime_manifest", True, candidate["route_id"], candidate["candidate_id"], task_id)
+
+
 def advance_after_completion(conn, task_id: str) -> None:
     """Move the single active watch to the permitted next strict stage."""
     candidate = _candidate_row(conn, task_id)
@@ -643,6 +768,22 @@ def reconcile_strict_route(conn, request: dict, *, board: Optional[str] = None) 
             return _refuse("STALE_OR_SUPERSEDED", "route already has an active revision", request, route_id)
         revision_id = "srv_" + secrets.token_hex(10)
         conn.execute("INSERT INTO strict_route_revisions VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL)", (revision_id, route_id, str(route["route_revision"]), SCHEMA_VERSION, route["requirements_digest"], risk_digest, now))
+        # These immutable facts are associations, not scheduling edges.  They
+        # are persisted with admission so every later lifecycle operation can
+        # prove the candidate still belongs to the same source/root/digest/risk
+        # route instead of trusting task_links or a caller-supplied task id.
+        for kind, target_type, target_id in (
+            ("governing_source", "source", route["governing_source_id"]),
+            ("root_task", "task", route["root_task_id"]),
+            ("requirements_digest", "digest", route["requirements_digest"]),
+            ("risk_digest", "digest", risk_digest),
+        ):
+            conn.execute(
+                "INSERT INTO strict_route_associations "
+                "(revision_id, subject_type, subject_id, kind, target_type, target_id, created_at) "
+                "VALUES (?, 'route', ?, ?, ?, ?, ?)",
+                (revision_id, route_id, kind, target_type, target_id, now),
+            )
         for receipt in receipts:
             conn.execute("INSERT INTO strict_route_receipts (revision_id, receipt_id, kind, digest, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)", (revision_id, receipt["receipt_id"], receipt["kind"], receipt["digest"], json.dumps(receipt.get("payload"), sort_keys=True), now))
         candidates = {}
@@ -682,27 +823,57 @@ def is_current_eligible(conn, task_id: str, operation: str) -> StrictEligibility
     watch = conn.execute("SELECT task_id FROM strict_route_watches WHERE revision_id=? AND active=1", (row["revision_id"],)).fetchone()
     if operation == "claim_review":
         return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, "OPERATION_NOT_ALLOWED")
-    if row["stage_kind"] == "rollout" and operation in {"unblock", "claim", "dispatch_enumerate", "complete", "promote"}:
-        return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, "ROLLOUT_AUTHORITY_REQUIRED")
-    if row["stage_kind"] == "qa" and operation in {"recompute_ready", "claim", "promote", "dispatch_enumerate"}:
+    active_operations = {"complete", "recompute_ready", "claim", "claim_review", "promote", "unblock", "block", "release_stale", "reclaim", "crash_recovery", "timeout_recovery", "dispatch_enumerate", "dispatch_claim", "dispatch_spawn", "dashboard_status", "dashboard_link", "runtime_manifest"}
+    # Report a missing receipt floor deterministically even when the candidate
+    # is not the active watch target.  This keeps force-promotion/dashboard
+    # refusals actionable while the later active-watch check still prevents a
+    # stale candidate from ever being revived.
+    if row["stage_kind"] == "rollout" and operation in {"unblock", "claim", "dispatch_enumerate", "dispatch_claim", "dispatch_spawn", "complete", "promote", "runtime_manifest"}:
+        authority_code, authority_missing = _exact_receipt_floor(conn, row, ("rollout_authority",), purpose="rollout_authority")
+        manifest_code, manifest_missing = _exact_receipt_floor(conn, row, ("runtime_manifest",), purpose="runtime_manifest")
+        if authority_code or manifest_code:
+            return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, "ROLLOUT_AUTHORITY_REQUIRED", authority_missing or manifest_missing)
+    if row["stage_kind"] == "qa" and operation in {"recompute_ready", "claim", "promote", "dispatch_enumerate", "dispatch_claim", "dispatch_spawn", "complete"}:
+        developer = conn.execute("SELECT * FROM strict_route_candidates WHERE revision_id=? AND stage_key=?", (row["revision_id"], f"developer.{row['cycle']}")).fetchone()
+        receipt_code, missing = _exact_receipt_floor(conn, developer, IMPLEMENTATION_RECEIPTS, purpose="completion") if developer is not None else ("MISSING_RECEIPT", tuple(IMPLEMENTATION_RECEIPTS))
+        if receipt_code:
+            return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, receipt_code, missing)
+    if row["state"] != "active" or row["revision_state"] != "active" or watch is None or (operation in active_operations and watch["task_id"] != task_id):
+        return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, "NOT_CURRENT_CANDIDATE", active_task_id=watch["task_id"] if watch else None, expected_route_revision=row["route_revision"])
+    identity_refusal = _strict_identity_refusal(conn, row)
+    if identity_refusal:
+        return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, identity_refusal, active_task_id=watch["task_id"], expected_route_revision=row["route_revision"])
+    if row["stage_kind"] == "rollout" and operation in {"unblock", "claim", "dispatch_enumerate", "dispatch_claim", "dispatch_spawn", "complete", "promote", "runtime_manifest"}:
+        authority_code, authority_missing = _exact_receipt_floor(
+            conn, row, ("rollout_authority",), purpose="rollout_authority",
+        )
+        manifest_code, manifest_missing = _exact_receipt_floor(
+            conn, row, ("runtime_manifest",), purpose="runtime_manifest",
+        )
+        if authority_code or manifest_code:
+            return StrictEligibilityResult(
+                False, operation, True, row["route_id"], row["candidate_id"], task_id,
+                "ROLLOUT_AUTHORITY_REQUIRED",
+                authority_missing or manifest_missing,
+                active_task_id=watch["task_id"], expected_route_revision=row["route_revision"],
+            )
+    if row["stage_kind"] == "qa" and operation in {"recompute_ready", "claim", "promote", "dispatch_enumerate", "dispatch_claim", "dispatch_spawn", "complete"}:
         developer = conn.execute(
             "SELECT * FROM strict_route_candidates WHERE revision_id=? AND stage_key=?",
             (row["revision_id"], f"developer.{row['cycle']}"),
         ).fetchone()
-        present = _candidate_receipt_kinds(conn, developer) if developer else set()
-        missing = tuple(kind for kind in IMPLEMENTATION_RECEIPTS if kind not in present)
-        if missing:
-            return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, "MISSING_RECEIPT", missing)
-    active_operations = {"complete", "recompute_ready", "claim", "claim_review", "promote", "unblock", "block", "release_stale", "reclaim", "crash_recovery", "timeout_recovery", "dispatch_enumerate", "dispatch_claim", "dispatch_spawn", "dashboard_status", "dashboard_link"}
-    if row["state"] != "active" or row["revision_state"] != "active" or watch is None or (operation in active_operations and watch["task_id"] != task_id):
-        return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, "NOT_CURRENT_CANDIDATE", active_task_id=watch["task_id"] if watch else None, expected_route_revision=row["route_revision"])
+        receipt_code, missing = (
+            _exact_receipt_floor(conn, developer, IMPLEMENTATION_RECEIPTS, purpose="completion")
+            if developer is not None else ("MISSING_RECEIPT", tuple(IMPLEMENTATION_RECEIPTS))
+        )
+        if receipt_code:
+            return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, receipt_code, missing)
     if row["stage_kind"] == "developer" and operation == "complete":
-        present = _candidate_receipt_kinds(conn, row)
-        missing = tuple(kind for kind in IMPLEMENTATION_RECEIPTS if kind not in present)
-        if missing:
-            return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, "MISSING_RECEIPT", missing)
+        receipt_code, missing = _exact_receipt_floor(conn, row, IMPLEMENTATION_RECEIPTS, purpose="completion")
+        if receipt_code:
+            return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, receipt_code, missing)
     if row["stage_kind"] == "developer" and operation in {"recompute_ready", "claim", "dispatch_enumerate"}:
-        missing = tuple(kind for kind in ADMISSION_RECEIPTS if kind not in _candidate_receipt_kinds(conn, row))
-        if missing:
-            return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, "MISSING_RECEIPT", missing)
+        receipt_code, missing = _exact_receipt_floor(conn, row, ADMISSION_RECEIPTS, purpose="admission")
+        if receipt_code:
+            return StrictEligibilityResult(False, operation, True, row["route_id"], row["candidate_id"], task_id, receipt_code, missing)
     return StrictEligibilityResult(True, operation, True, row["route_id"], row["candidate_id"], task_id, active_task_id=watch["task_id"], expected_route_revision=row["route_revision"])

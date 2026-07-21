@@ -74,8 +74,8 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     _release_singleton_lock(h3)
 
 
-def test_active_watch_runtime_manifest_is_read_only_and_current(tmp_path, monkeypatch):
-    """Watcher manifests observe the active route without loading runtime state."""
+def test_active_watch_runtime_manifest_excludes_pre_rollout_candidate(tmp_path, monkeypatch):
+    """A developer watch is not rollout authority and cannot create a manifest."""
     from hermes_cli import kanban_db as kb
 
     home = tmp_path / ".hermes"
@@ -100,12 +100,10 @@ def test_active_watch_runtime_manifest_is_read_only_and_current(tmp_path, monkey
         })
         assert result.ok is True
         assert result.route is not None
-        before = conn.total_changes
         manifests = _active_watch_runtime_manifests(conn)
 
-        assert manifests == [{
-            "schema_version": "strict-route/v1", "route_id": result.route["route_id"],
-            "route_revision": "1", "task_id": result.candidates["developer.0"]["task_id"],
-            "stage_kind": "developer", "requirements_digest": "requirements",
-        }]
-        assert conn.total_changes == before
+        assert manifests == []
+        assert conn.execute(
+            "SELECT COUNT(*) FROM strict_route_candidate_receipts "
+            "WHERE purpose='runtime_manifest'"
+        ).fetchone()[0] == 0
