@@ -1,8 +1,38 @@
 import { mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('node:v8', () => ({
+  getHeapSnapshot: () => Readable.from(['mock heap snapshot']),
+  getHeapSpaceStatistics: () => [
+    {
+      physical_space_size: 1024,
+      space_available_size: 512,
+      space_name: 'old_space',
+      space_size: 1024,
+      space_used_size: 256
+    }
+  ],
+  getHeapStatistics: () => ({
+    does_zap_garbage: 0,
+    external_memory: 0,
+    heap_size_limit: 1024 * 1024 * 1024,
+    malloced_memory: 0,
+    number_of_detached_contexts: 0,
+    number_of_native_contexts: 1,
+    peak_malloced_memory: 0,
+    total_available_size: 1024,
+    total_global_handles_size: 0,
+    total_heap_size: 1024,
+    total_heap_size_executable: 0,
+    total_physical_size: 1024,
+    used_global_handles_size: 0,
+    used_heap_size: 512
+  })
+}))
 
 import { performHeapDump } from './memory.js'
 
