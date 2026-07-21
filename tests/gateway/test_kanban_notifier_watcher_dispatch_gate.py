@@ -72,3 +72,12 @@ def test_notifier_watcher_runs_when_dispatch_enabled():
                     asyncio.run(runner._kanban_notifier_watcher())
 
     assert past_gate, "list_boards should be called when dispatch_in_gateway=true"
+
+
+def test_dispatch_gate_prevents_runtime_manifest_observation():
+    """A non-dispatch gateway cannot manufacture strict rollout evidence."""
+    runner = _make_runner()
+    with patch("hermes_cli.config.load_config", return_value=_fake_config(False)):
+        with patch("gateway.kanban_watchers._active_watch_runtime_manifests") as manifests:
+            asyncio.run(runner._kanban_dispatcher_watcher())
+    manifests.assert_not_called()

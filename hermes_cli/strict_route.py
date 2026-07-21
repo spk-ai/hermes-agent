@@ -728,10 +728,20 @@ def reconcile_strict_route(conn, request: dict, *, board: Optional[str] = None) 
         return _refuse("UNSUPPORTED_INTERNAL_APPROVAL", "normal-scope routes cannot materialize approval work", request)
     if stage["kind"] != "developer" or stage["key"] != f"developer.{int(stage['cycle'])}":
         return _refuse("INVALID_STAGE", "initial admission must reconcile developer.<cycle>", request)
-    supplied_kinds = {item.get("kind") for item in receipts if isinstance(item, dict)}
-    missing = ADMISSION_RECEIPTS - supplied_kinds
+    admission_receipts = {
+        kind: [item for item in receipts if isinstance(item, dict) and item.get("kind") == kind]
+        for kind in ADMISSION_RECEIPTS
+    }
+    missing = tuple(kind for kind, items in admission_receipts.items() if not items)
     if missing:
         return _refuse("MISSING_RECEIPT", f"missing admission receipts: {', '.join(sorted(missing))}", request)
+    duplicated = tuple(kind for kind, items in admission_receipts.items() if len(items) != 1)
+    if duplicated:
+        return _refuse(
+            "RECEIPT_CARDINALITY_INVALID",
+            f"admission requires exactly one receipt of each kind: {', '.join(sorted(duplicated))}",
+            request,
+        )
 
     for receipt in receipts:
         refusal_code = _validate_admission_receipt(receipt, route["route_revision"])
@@ -741,13 +751,14 @@ def reconcile_strict_route(conn, request: dict, *, board: Optional[str] = None) 
                 "strict-route/v1 receipt is incomplete, stale, or does not match its payload",
                 request,
             )
-    risk_receipts = [item for item in receipts if item.get("kind") == "risk_classification"]
-    if len(risk_receipts) != 1:
-        return _refuse("RECEIPT_CARDINALITY_INVALID", "exactly one risk classification receipt is required", request)
-    risk_payload = risk_receipts[0].get("payload")
-    if isinstance(risk_payload, dict):
-        if any(bool(risk_payload.get(key, False)) != value for key, value in risk_flags.items()):
-            return _refuse("RISK_CLASSIFICATION_MISMATCH", "risk receipt does not match route risk", request)
+    source_payload = admission_receipts["detector_source"][0].get("payload")
+    if not isinstance(source_payload, dict) or source_payload.get("source") != route["governing_source_id"]:
+        return _refuse("SOURCE_OR_ROOT_MISMATCH", "source receipt does not match route source", request)
+    risk_payload = admission_receipts["risk_classification"][0].get("payload")
+    if not isinstance(risk_payload, dict) or any(
+        bool(risk_payload.get(key, False)) != value for key, value in risk_flags.items()
+    ):
+        return _refuse("RISK_CLASSIFICATION_MISMATCH", "risk receipt does not match route risk", request)
 
     now, risk_digest = int(time.time()), _risk_digest(route)
     with kb.write_txn(conn):
