@@ -239,7 +239,7 @@ def test_strict_route_receipt_tool_refuses_noncurrent_issuer_witness(worker_env)
     with kb.connect() as conn:
         admitted = kb.reconcile_strict_route(conn, _strict_route_request())
         task_id = admitted.candidates["developer.0"]["task_id"]
-    payload = {"commit": "a" * 40}
+    payload = {"sha": "a" * 40, "remote_ref": "origin/control/aa159"}
     witness = {
         "schema_version": "strict-route/v1",
         "receipt_id": "issuer-witness",
@@ -257,6 +257,7 @@ def test_strict_route_receipt_tool_refuses_noncurrent_issuer_witness(worker_env)
         "board": "default",
         "task_id": task_id,
         "receipt_kind": "implementation_commit",
+        "receipt_purpose": "completion",
         "payload": payload,
         "immutable_digest": witness["digest"],
         "issuer_witness": witness,

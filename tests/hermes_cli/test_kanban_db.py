@@ -5013,6 +5013,29 @@ def _normal_strict_route_request():
     }
 
 
+def _developer_completion_metadata():
+    commit = {"sha": "a" * 40, "remote_ref": "origin/control/aa159"}
+    return {
+        "commit_sha": commit,
+        "baseline_sha": {
+            "baseline_sha": "b" * 40,
+            "descendant_sha": commit["sha"],
+            "is_ancestor": True,
+        },
+        "changed_files": {"paths": ["hermes_cli/kanban_db.py"]},
+        "focused_test_output": {
+            "command": "scripts/run_tests.sh tests/hermes_cli/test_kanban_db.py -q",
+            "output": "237 passed",
+            "exit_code": 0,
+        },
+        "full_test_output": {
+            "command": "scripts/run_tests.sh -q",
+            "output": "17000 passed",
+            "exit_code": 0,
+        },
+    }
+
+
 def test_strict_route_reconcile_is_idempotent_and_materializes_only_execution_link(kanban_home):
     with kb.connect() as conn:
         first = kb.reconcile_strict_route(conn, _normal_strict_route_request())
@@ -5107,19 +5130,97 @@ def test_strict_route_developer_completion_receipt_unlocks_only_qa(kanban_home):
             conn,
             developer,
             summary="implementation receipt",
-            metadata={
-                "commit_sha": "a" * 40,
-                "baseline_sha": "b" * 40,
-                "changed_files": ["hermes_cli/kanban_db.py"],
-                "focused_test_output": "233 passed",
-                "full_test_output": "17000 passed",
-            },
+            metadata=_developer_completion_metadata(),
         ) is True
 
         assert kb.get_task(conn, qa).status == "ready"
         assert kb.get_task(conn, rollout).status == "blocked"
         assert kb.is_current_eligible(conn, qa, "claim").allowed is True
         assert kb.is_current_eligible(conn, rollout, "unblock").reason_code == "ROLLOUT_AUTHORITY_REQUIRED"
+
+
+def test_strict_route_completion_rejects_unstructured_or_inactive_receipts_before_binding(kanban_home):
+    with kb.connect() as conn:
+        admitted = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+        developer = admitted.candidates["developer.0"]["task_id"]
+        qa = admitted.candidates["qa.0"]["task_id"]
+
+        invalid = _developer_completion_metadata()
+        invalid["changed_files"] = ["hermes_cli/kanban_db.py"]
+        assert kb.complete_task(conn, developer, summary="legacy receipt", metadata=invalid) is False
+        developer_task = kb.get_task(conn, developer)
+        assert developer_task is not None
+        assert developer_task.status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM strict_route_candidate_receipts "
+            "WHERE candidate_id=? AND purpose='completion'",
+            (admitted.candidates["developer.0"]["candidate_id"],),
+        ).fetchone()["count"] == 0
+
+        assert kb.complete_task(
+            conn, developer, summary="valid receipt", metadata=_developer_completion_metadata(),
+        ) is True
+        assert kb.complete_task(
+            conn, developer, summary="stale receipt", metadata=_developer_completion_metadata(),
+        ) is False
+        qa_task = kb.get_task(conn, qa)
+        assert qa_task is not None
+        assert qa_task.status == "ready"
+
+
+def test_strict_route_external_receipts_require_permitted_purpose_and_current_watch(kanban_home):
+    with kb.connect() as conn:
+        admitted = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+        developer = admitted.candidates["developer.0"]
+        qa = admitted.candidates["qa.0"]
+        payload = _developer_completion_metadata()["commit_sha"]
+
+        def request(task_id, kind="implementation_commit", purpose="completion"):
+            return {
+                "schema_version": "strict-route/v1",
+                "request_id": "external-receipt",
+                "board": "default",
+                "task_id": task_id,
+                "receipt_kind": kind,
+                "receipt_purpose": purpose,
+                "payload": payload,
+                "immutable_digest": hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "issuer_witness": {
+                    "schema_version": "strict-route/v1",
+                    "receipt_id": "issuer-witness",
+                    "kind": kind,
+                    "payload": payload,
+                    "digest": hashlib.sha256(
+                        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "current": True,
+                    "route_revision": "1",
+                },
+            }
+
+        assert kb.record_strict_route_receipt(
+            conn, request(developer["task_id"], kind="arbitrary"),
+        ).reason_code == "RECEIPT_KIND_NOT_PERMITTED"
+        assert kb.record_strict_route_receipt(
+            conn, request(developer["task_id"], purpose="external"),
+        ).reason_code == "RECEIPT_PURPOSE_NOT_PERMITTED"
+        assert kb.record_strict_route_receipt(
+            conn, request(qa["task_id"]),
+        ).reason_code == "NOT_CURRENT_CANDIDATE"
+        assert kb.record_strict_route_receipt(conn, request(developer["task_id"])).allowed is True
+
+        conflicting = request(developer["task_id"])
+        conflicting["payload"] = {"sha": "a" * 40, "remote_ref": "origin/control/different"}
+        conflicting["immutable_digest"] = hashlib.sha256(
+            json.dumps(conflicting["payload"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        conflicting["issuer_witness"]["payload"] = conflicting["payload"]
+        conflicting["issuer_witness"]["digest"] = conflicting["immutable_digest"]
+        assert kb.record_strict_route_receipt(
+            conn, conflicting,
+        ).reason_code == "RECEIPT_IMMUTABLE_CONFLICT"
 
 
 def test_strict_route_qa_fail_materializes_one_repair_cycle(kanban_home):
@@ -5131,13 +5232,7 @@ def test_strict_route_qa_fail_materializes_one_repair_cycle(kanban_home):
             conn,
             developer,
             summary="implementation receipt",
-            metadata={
-                "commit_sha": "a" * 40,
-                "baseline_sha": "b" * 40,
-                "changed_files": ["hermes_cli/kanban_db.py"],
-                "focused_test_output": "234 passed",
-                "full_test_output": "17000 passed",
-            },
+            metadata=_developer_completion_metadata(),
         ) is True
 
         assert kb.complete_task(
@@ -5147,7 +5242,7 @@ def test_strict_route_qa_fail_materializes_one_repair_cycle(kanban_home):
             metadata={
                 "verdict": "FAIL",
                 "fresh_hermes_home": "/tmp/qa-home",
-                "implementation_commit": "a" * 40,
+                "implementation_commit": _developer_completion_metadata()["commit_sha"],
             },
         ) is True
 
