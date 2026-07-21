@@ -11,6 +11,8 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import sqlite3
@@ -110,34 +112,66 @@ def _release_singleton_lock(handle) -> None:
 
 
 def _active_watch_runtime_manifests(conn) -> list[dict[str, str]]:
-    """Return read-only manifests for current strict-route active watches.
+    """Persist/read back authorized rollout manifests for current watches.
 
-    The gateway dispatcher may observe this boundary for diagnostics, but it
-    never treats a manifest as permission to restart, load, or otherwise
-    mutate a runtime. Runtime activation remains an explicit rollout receipt
-    owned by the native strict-route lifecycle.
+    Capturing this evidence never loads, restarts, deploys, or claims a
+    runtime.  It records only the module bytes this already-running gateway
+    observed, after the native strict-route ledger has accepted typed rollout
+    authority; the ledger remains the policy authority.
     """
     from hermes_cli import kanban_db as _kb
+    from hermes_cli.strict_route import persist_runtime_manifest
 
     rows = conn.execute(
-        "SELECT w.task_id, w.role, w.route_digest, r.route_id, r.route_revision "
+        "SELECT w.candidate_id, w.task_id, w.role, w.route_digest, r.route_id, r.route_revision "
         "FROM strict_route_watches w "
         "JOIN strict_route_revisions r ON r.revision_id = w.revision_id "
         "WHERE w.active = 1 AND r.state = 'active' ORDER BY w.watch_id"
     ).fetchall()
     manifests: list[dict[str, str]] = []
     for row in rows:
+        if row["role"] != "rollout":
+            continue
+        bound = conn.execute(
+            "SELECT r.payload FROM strict_route_receipts r "
+            "JOIN strict_route_candidate_receipts b ON b.receipt_pk=r.receipt_pk "
+            "WHERE b.candidate_id=? AND b.purpose='runtime_manifest' "
+            "AND r.kind='runtime_manifest' ORDER BY r.receipt_pk DESC",
+            (row["candidate_id"],),
+        ).fetchall()
+        if not bound:
+            module_paths = [Path(__file__).resolve(), Path(_kb.__file__).resolve()]
+            module_hashes = {
+                str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in module_paths
+            }
+            persisted = persist_runtime_manifest(conn, row["task_id"], {
+                "schema_version": "strict-route/v1",
+                "generated_at": int(time.time()),
+                "pid": os.getpid(),
+                "board_db_path": str(Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()),
+                "watch_task_id": row["task_id"],
+                "requirements_digest": row["route_digest"],
+                "module_hashes": module_hashes,
+            })
+            if not persisted.allowed:
+                continue
+            bound = conn.execute(
+                "SELECT r.payload FROM strict_route_receipts r "
+                "JOIN strict_route_candidate_receipts b ON b.receipt_pk=r.receipt_pk "
+                "WHERE b.candidate_id=? AND b.purpose='runtime_manifest' "
+                "AND r.kind='runtime_manifest' ORDER BY r.receipt_pk DESC",
+                (row["candidate_id"],),
+            ).fetchall()
         eligibility = _kb.is_current_eligible(conn, row["task_id"], "runtime_manifest")
         if not eligibility.allowed:
             continue
-        manifests.append({
-            "schema_version": "strict-route/v1",
-            "route_id": row["route_id"],
-            "route_revision": row["route_revision"],
-            "task_id": row["task_id"],
-            "stage_kind": row["role"],
-            "requirements_digest": row["route_digest"],
-        })
+        try:
+            manifest = json.loads(bound[0]["payload"])
+        except (IndexError, TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(manifest, dict):
+            manifests.append(manifest)
     return manifests
 
 

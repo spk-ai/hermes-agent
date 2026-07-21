@@ -6497,6 +6497,13 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        strict = is_current_eligible(conn, tid, "timeout_recovery")
+        if not strict.allowed:
+            with write_txn(conn):
+                _append_event(conn, tid, "strict_eligibility_refused", {
+                    "operation": "timeout_recovery", "reason_code": strict.reason_code,
+                })
+            continue
         # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
@@ -6634,6 +6641,13 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+        strict = is_current_eligible(conn, tid, "release_stale")
+        if not strict.allowed:
+            with write_txn(conn):
+                _append_event(conn, tid, "strict_eligibility_refused", {
+                    "operation": "release_stale", "reason_code": strict.reason_code,
+                })
+            continue
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
@@ -6842,6 +6856,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if time.time() - started_at < grace:
                     continue
             if _pid_alive(row["worker_pid"]):
+                continue
+
+            strict = is_current_eligible(conn, row["id"], "crash_recovery")
+            if not strict.allowed:
+                _append_event(conn, row["id"], "strict_eligibility_refused", {
+                    "operation": "crash_recovery", "reason_code": strict.reason_code,
+                })
                 continue
 
             pid = int(row["worker_pid"])

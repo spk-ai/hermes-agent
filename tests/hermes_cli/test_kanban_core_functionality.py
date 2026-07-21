@@ -11,6 +11,7 @@ parity across every registered verb.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -49,6 +50,74 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     kb.init_db()
     return home
+
+
+def test_strict_route_rejects_direct_link_from_core_kernel(kanban_home):
+    """Direct kernel callers cannot turn strict evidence into task_links."""
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+            "kind": kind, "payload": payload,
+            "digest": hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "current": True, "route_revision": "1",
+        }
+
+    request = {
+        "schema_version": "strict-route/v1", "request_id": "core-link",
+        "route": {
+            "governing_board": "default", "governing_source_id": "source",
+            "root_task_id": "root", "route_revision": "1",
+            "requirements_digest": "digest",
+            "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False},
+        },
+        "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "core/link"},
+        "receipts": [
+            receipt("source", "detector_source", {"source": "source"}),
+            receipt("risk", "risk_classification", {"external": False, "credentials": False, "payment": False, "production_risk": False}),
+            receipt("plan", "planning_materialization", {"plan": "core"}),
+        ],
+    }
+    conn = kb.connect()
+    try:
+        admitted = kb.reconcile_strict_route(conn, request)
+        developer = admitted.candidates["developer.0"]["task_id"]
+        qa = admitted.candidates["qa.0"]["task_id"]
+        with pytest.raises(ValueError, match="ASSOCIATION_NOT_EXECUTION_LINK"):
+            kb.link_tasks(conn, developer, qa)
+        assert kb.parent_ids(conn, qa) == [developer]
+    finally:
+        conn.close()
+
+
+def test_strict_route_rejects_duplicate_admission_receipt_before_mutation(kanban_home):
+    """Ambiguous admission evidence cannot create a later-unclaimable route."""
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+            "kind": kind, "payload": payload,
+            "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "current": True, "route_revision": "1",
+        }
+
+    risk = {"external": False, "credentials": False, "payment": False, "production_risk": False}
+    request = {
+        "schema_version": "strict-route/v1", "request_id": "duplicate-admission",
+        "route": {"governing_board": "default", "governing_source_id": "source", "root_task_id": "root", "route_revision": "1", "requirements_digest": "digest", "risk": risk},
+        "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "core/duplicate"},
+        "receipts": [receipt("source-a", "detector_source", {"source": "source"}), receipt("source-b", "detector_source", {"source": "source-b"}), receipt("risk", "risk_classification", risk), receipt("plan", "planning_materialization", {"plan": "core"})],
+    }
+    conn = kb.connect()
+    try:
+        result = kb.reconcile_strict_route(conn, request)
+        assert result.ok is False
+        assert result.refusal is not None
+        assert result.refusal.code == "RECEIPT_CARDINALITY_INVALID"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM strict_route_revisions").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
