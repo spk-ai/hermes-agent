@@ -100,6 +100,28 @@ def _receipt_digest(payload: Any) -> str:
     ).hexdigest()
 
 
+def _validate_admission_receipt(receipt: Any, route_revision: Any) -> Optional[str]:
+    """Return a typed refusal code for an invalid strict-route/v1 receipt.
+
+    Receipt admission is deliberately stronger than a truthiness check: the
+    currentness witness is boolean, the receipt is bound to this revision, and
+    its digest must authenticate its canonical payload.
+    """
+    if not isinstance(receipt, dict) or any(
+        not receipt.get(key) for key in ("schema_version", "receipt_id", "kind", "digest")
+    ) or "payload" not in receipt:
+        return "MISSING_RECEIPT"
+    if receipt["schema_version"] != SCHEMA_VERSION:
+        return "UNSUPPORTED_SCHEMA_VERSION"
+    if receipt.get("current") is not True:
+        return "RECEIPT_NOT_CURRENT"
+    if str(receipt.get("route_revision")) != str(route_revision):
+        return "STALE_OR_SUPERSEDED"
+    if receipt["digest"] != _receipt_digest(receipt["payload"]):
+        return "RECEIPT_MISMATCH"
+    return None
+
+
 def _candidate_row(conn, task_id: str):
     return conn.execute(
         "SELECT c.*, r.route_id, r.route_revision FROM strict_route_candidates c "
@@ -394,14 +416,11 @@ def reconcile_strict_route(conn, request: dict, *, board: Optional[str] = None) 
         return _refuse("MISSING_RECEIPT", f"missing admission receipts: {', '.join(sorted(missing))}", request)
 
     for receipt in receipts:
-        if not isinstance(receipt, dict) or not all(
-            receipt.get(key) for key in ("receipt_id", "kind", "digest")
-        ):
-            return _refuse("MISSING_RECEIPT", "receipt identity is incomplete", request)
-        if receipt.get("kind") in ADMISSION_RECEIPTS and receipt.get("current") is False:
+        refusal_code = _validate_admission_receipt(receipt, route["route_revision"])
+        if refusal_code:
             return _refuse(
-                "RECEIPT_NOT_CURRENT",
-                f"{receipt['kind']} receipt is not current",
+                refusal_code,
+                "strict-route/v1 receipt is incomplete, stale, or does not match its payload",
                 request,
             )
     risk_receipts = [item for item in receipts if item.get("kind") == "risk_classification"]

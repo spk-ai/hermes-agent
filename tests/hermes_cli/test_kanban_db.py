@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -4967,6 +4969,19 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
 
 
 def _normal_strict_route_request():
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1",
+            "receipt_id": receipt_id,
+            "kind": kind,
+            "payload": payload,
+            "digest": hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "current": True,
+            "route_revision": "1",
+        }
+
     return {
         "schema_version": "strict-route/v1",
         "request_id": "req-aa159",
@@ -4988,9 +5003,12 @@ def _normal_strict_route_request():
             "idempotency_key": "aa159/developer/0",
         },
         "receipts": [
-            {"receipt_id": "detector", "kind": "detector_source", "digest": "detector-digest"},
-            {"receipt_id": "risk", "kind": "risk_classification", "digest": "risk-digest"},
-            {"receipt_id": "plan", "kind": "planning_materialization", "digest": "plan-digest"},
+            receipt("detector", "detector_source", {"source": "detector-aa159"}),
+            receipt("risk", "risk_classification", {
+                "external": False, "credentials": False, "payment": False,
+                "production_risk": False,
+            }),
+            receipt("plan", "planning_materialization", {"plan": "aa159"}),
         ],
     }
 
@@ -5044,6 +5062,24 @@ def test_strict_route_refuses_noncurrent_nested_risk_receipt_before_any_mutation
 
         assert result.ok is False
         assert result.refusal.code == "RECEIPT_NOT_CURRENT"
+        assert kb.list_tasks(conn) == []
+
+
+def test_strict_route_refuses_receipt_without_typed_currentness_or_matching_digest(kanban_home):
+    request = _normal_strict_route_request()
+    request["receipts"][0]["current"] = "yes"
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, request)
+        assert result.ok is False
+        assert result.refusal.code == "RECEIPT_NOT_CURRENT"
+        assert kb.list_tasks(conn) == []
+
+    request = _normal_strict_route_request()
+    request["receipts"][0]["digest"] = "not-the-payload-digest"
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, request)
+        assert result.ok is False
+        assert result.refusal.code == "RECEIPT_MISMATCH"
         assert kb.list_tasks(conn) == []
 
 
