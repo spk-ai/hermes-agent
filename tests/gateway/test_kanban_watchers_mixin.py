@@ -7,9 +7,14 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _active_watch_runtime_manifests,
+)
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -67,3 +72,40 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     h3, st3 = _acquire_singleton_lock(lock)
     assert st3 == "held" and h3 is not None
     _release_singleton_lock(h3)
+
+
+def test_active_watch_runtime_manifest_is_read_only_and_current(tmp_path, monkeypatch):
+    """Watcher manifests observe the active route without loading runtime state."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.discard(str(kb.kanban_db_path().resolve()))
+    with kb.connect() as conn:
+        def receipt(receipt_id, kind, payload):
+            return {
+                "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+                "kind": kind, "payload": payload,
+                "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                "current": True, "route_revision": "1",
+            }
+
+        result = kb.reconcile_strict_route(conn, {
+            "schema_version": "strict-route/v1", "request_id": "watcher-manifest",
+            "route": {"governing_board": "default", "governing_source_id": "watcher", "root_task_id": "root", "route_revision": "1", "requirements_digest": "requirements", "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False}},
+            "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "watcher/developer/0"},
+            "receipts": [receipt("detector", "detector_source", {"source": "watcher"}), receipt("risk", "risk_classification", {"external": False, "credentials": False, "payment": False, "production_risk": False}), receipt("plan", "planning_materialization", {"plan": "watcher"})],
+        })
+        assert result.ok is True
+        assert result.route is not None
+        before = conn.total_changes
+        manifests = _active_watch_runtime_manifests(conn)
+
+        assert manifests == [{
+            "schema_version": "strict-route/v1", "route_id": result.route["route_id"],
+            "route_revision": "1", "task_id": result.candidates["developer.0"]["task_id"],
+            "stage_kind": "developer", "requirements_digest": "requirements",
+        }]
+        assert conn.total_changes == before

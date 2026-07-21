@@ -109,6 +109,38 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _active_watch_runtime_manifests(conn) -> list[dict[str, str]]:
+    """Return read-only manifests for current strict-route active watches.
+
+    The gateway dispatcher may observe this boundary for diagnostics, but it
+    never treats a manifest as permission to restart, load, or otherwise
+    mutate a runtime. Runtime activation remains an explicit rollout receipt
+    owned by the native strict-route lifecycle.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    rows = conn.execute(
+        "SELECT w.task_id, w.role, w.route_digest, r.route_id, r.route_revision "
+        "FROM strict_route_watches w "
+        "JOIN strict_route_revisions r ON r.revision_id = w.revision_id "
+        "WHERE w.active = 1 AND r.state = 'active' ORDER BY w.watch_id"
+    ).fetchall()
+    manifests: list[dict[str, str]] = []
+    for row in rows:
+        eligibility = _kb.is_current_eligible(conn, row["task_id"], "runtime_manifest")
+        if not eligibility.allowed:
+            continue
+        manifests.append({
+            "schema_version": "strict-route/v1",
+            "route_id": row["route_id"],
+            "route_revision": row["route_revision"],
+            "task_id": row["task_id"],
+            "stage_kind": row["role"],
+            "requirements_digest": row["route_digest"],
+        })
+    return manifests
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -1013,6 +1045,12 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                manifests = _active_watch_runtime_manifests(conn)
+                if manifests:
+                    logger.debug(
+                        "kanban dispatcher: observed %d strict-route runtime manifest(s) on board %s",
+                        len(manifests), slug,
+                    )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,

@@ -309,6 +309,23 @@ def record_strict_route_receipt(conn, request: dict, *, board: Optional[str] = N
         candidate = _candidate_row(conn, request["task_id"])
         if candidate is None:
             return StrictEligibilityResult(False, "record_receipt", False, task_id=request["task_id"], reason_code="OPERATION_NOT_ALLOWED")
+        witness_code = _validate_admission_receipt(
+            request["issuer_witness"], candidate["route_revision"],
+        )
+        if witness_code:
+            return StrictEligibilityResult(
+                False, "record_receipt", True, candidate["route_id"],
+                candidate["candidate_id"], request["task_id"], witness_code,
+            )
+        witness = request["issuer_witness"]
+        if (
+            witness.get("kind") != request["receipt_kind"]
+            or witness.get("payload") != request.get("payload")
+        ):
+            return StrictEligibilityResult(
+                False, "record_receipt", True, candidate["route_id"],
+                candidate["candidate_id"], request["task_id"], "RECEIPT_MISMATCH",
+            )
         _bind_receipt(conn, candidate, request["receipt_kind"], request.get("payload"), purpose="external")
         kb._append_event(conn, request["task_id"], "strict_route_receipt_recorded", {
             "request_id": request["request_id"], "route_id": candidate["route_id"],
