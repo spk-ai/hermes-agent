@@ -515,6 +515,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--request", required=True,
         help="JSON strict-route/v1 request; output is JSON with canonical IDs or typed refusal",
     )
+    p_strict_route_receipt = p_strict_route_sub.add_parser(
+        "record-receipt", help="Record one immutable strict-route/v1 receipt",
+    )
+    p_strict_route_receipt.add_argument(
+        "--request", required=True,
+        help="JSON strict-route/v1 receipt request; output is JSON with a typed refusal",
+    )
 
     # --- claim ---
     p_claim = sub.add_parser(
@@ -1316,8 +1323,9 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_strict_route(args: argparse.Namespace) -> int:
-    if getattr(args, "strict_route_command", None) != "reconcile":
-        print("kanban strict-route: expected subcommand 'reconcile'", file=sys.stderr)
+    command = getattr(args, "strict_route_command", None)
+    if command not in {"reconcile", "record-receipt"}:
+        print("kanban strict-route: expected 'reconcile' or 'record-receipt'", file=sys.stderr)
         return 2
     try:
         request = json.loads(args.request)
@@ -1328,6 +1336,21 @@ def _cmd_strict_route(args: argparse.Namespace) -> int:
         print("kanban strict-route: request must be a JSON object", file=sys.stderr)
         return 2
     with kb.connect_closing() as conn:
+        if command == "record-receipt":
+            receipt = kb.record_strict_route_receipt(conn, request)
+            payload = {
+                "ok": receipt.allowed,
+                "schema_version": "strict-route/v1",
+                "task_id": receipt.task_id,
+                "route_id": receipt.route_id,
+                "candidate_id": receipt.candidate_id,
+            }
+            if not receipt.allowed:
+                payload["refusal"] = {"code": receipt.reason_code or "OPERATION_NOT_ALLOWED"}
+                print(json.dumps(payload, sort_keys=True))
+                return 1
+            print(json.dumps(payload, sort_keys=True))
+            return 0
         result = kb.reconcile_strict_route(conn, request)
     if not result.ok:
         refusal = result.refusal

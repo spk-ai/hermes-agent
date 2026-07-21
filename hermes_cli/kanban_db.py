@@ -3873,6 +3873,13 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    strict = is_current_eligible(conn, task_id, "reclaim")
+    if not strict.allowed:
+        with write_txn(conn):
+            _append_event(conn, task_id, "strict_eligibility_refused", {
+                "operation": "reclaim", "reason_code": strict.reason_code,
+            })
+        return False
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
@@ -7818,6 +7825,13 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
+            # Claiming is not the final authority boundary: a strict route can
+            # be superseded while its workspace resolves. Re-check directly
+            # before the process side effect.
+            strict = is_current_eligible(conn, claimed.id, "dispatch_spawn")
+            if not strict.allowed:
+                _record_spawn_failure(conn, claimed.id, strict.reason_code or "strict route refused")
+                continue
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
