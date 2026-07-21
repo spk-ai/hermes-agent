@@ -1109,6 +1109,66 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_strict_route_reconcile(args: dict, **kw) -> str:
+    """Forward a versioned strict-route request to the native DB authority."""
+    request = args.get("request")
+    if not isinstance(request, dict):
+        return tool_error("request must be a strict-route/v1 object")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            result = kb.reconcile_strict_route(conn, request, board=board)
+            if not result.ok:
+                refusal = result.refusal
+                return json.dumps({
+                    "ok": False,
+                    "refusal": {
+                        "code": refusal.code if refusal else "OPERATION_NOT_ALLOWED",
+                        "message": refusal.message if refusal else "strict route refused",
+                        "request_id": refusal.request_id if refusal else request.get("request_id"),
+                    },
+                })
+            return json.dumps({
+                "ok": True,
+                "replayed": result.replayed,
+                "route": result.route,
+                "candidates": result.candidates,
+                "execution_links": result.execution_links,
+                "active_watch": result.active_watch,
+                "cardinality": result.cardinality,
+            })
+        finally:
+            conn.close()
+    except (ValueError, TypeError) as e:
+        return tool_error(f"kanban_strict_route_reconcile: {e}")
+    except Exception as e:
+        logger.exception("kanban_strict_route_reconcile failed")
+        return tool_error(f"kanban_strict_route_reconcile: {e}")
+
+
+def _handle_strict_route_record_receipt(args: dict, **kw) -> str:
+    """Forward an immutable strict-route receipt to the native ledger."""
+    request = args.get("request")
+    if not isinstance(request, dict):
+        return tool_error("request must be a strict-route/v1 receipt object")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            result = kb.record_strict_route_receipt(conn, request, board=board)
+            return json.dumps({
+                "ok": result.allowed, "task_id": result.task_id,
+                "route_id": result.route_id, "candidate_id": result.candidate_id,
+                "refusal_code": result.reason_code,
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_strict_route_record_receipt failed")
+        return tool_error(f"kanban_strict_route_record_receipt: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -1602,6 +1662,33 @@ KANBAN_LINK_SCHEMA = {
 }
 
 
+KANBAN_STRICT_ROUTE_RECONCILE_SCHEMA = {
+    "name": "kanban_strict_route_reconcile",
+    "description": "Atomically reconcile an opt-in strict-route/v1 ledger request. Returns canonical candidates and a typed refusal; never falls back to generic task creation.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "request": {"type": "object", "description": "Exact strict-route/v1 request with route, stage, and immutable receipts."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["request"],
+    },
+}
+
+KANBAN_STRICT_ROUTE_RECEIPT_SCHEMA = {
+    "name": "kanban_strict_route_record_receipt",
+    "description": "Record one immutable, non-secret strict-route/v1 receipt without changing task status.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "request": {"type": "object", "description": "Exact strict-route/v1 receipt request."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["request"],
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -1685,4 +1772,22 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_strict_route_reconcile",
+    toolset="kanban",
+    schema=KANBAN_STRICT_ROUTE_RECONCILE_SCHEMA,
+    handler=_handle_strict_route_reconcile,
+    check_fn=_check_kanban_mode,
+    emoji="🧭",
+)
+
+registry.register(
+    name="kanban_strict_route_record_receipt",
+    toolset="kanban",
+    schema=KANBAN_STRICT_ROUTE_RECEIPT_SCHEMA,
+    handler=_handle_strict_route_record_receipt,
+    check_fn=_check_kanban_mode,
+    emoji="🧾",
 )

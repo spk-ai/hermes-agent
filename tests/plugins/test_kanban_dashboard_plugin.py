@@ -115,6 +115,32 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_strict_route_endpoint_returns_typed_refusal_without_generic_task_write(client):
+    request = {
+        "schema_version": "strict-route/v1",
+        "request_id": "dashboard-invalid",
+        "route": {
+            "governing_board": "default",
+            "governing_source_id": "detector",
+            "root_task_id": "root",
+            "route_revision": "v1",
+            "requirements_digest": "digest",
+            "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False},
+        },
+        "stage": {"key": "needs_input.0", "kind": "needs_input", "cycle": 0, "idempotency_key": "bad"},
+        "receipts": [],
+    }
+
+    response = client.post("/api/plugins/kanban/strict-routes/reconcile", json={"request": request})
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["schema_version"] == "strict-route/v1"
+    assert detail["code"] == "UNSUPPORTED_INTERNAL_APPROVAL"
+    with kb.connect() as conn:
+        assert kb.list_tasks(conn) == []
+
+
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
     client, tmp_path
 ):
