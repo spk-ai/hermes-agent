@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,19 @@ IMPLEMENTATION_RECEIPTS = (
     "focused_tests",
     "full_tests",
 )
+_GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_EXTERNAL_RECEIPT_PERMISSIONS = {
+    "developer": {kind: "completion" for kind in IMPLEMENTATION_RECEIPTS},
+    "qa": {
+        "qa_verdict": "qa_verdict",
+        "fresh_hermes_home": "qa_verdict",
+        "implementation_commit": "qa_verdict",
+    },
+    "rollout": {
+        "rollout_authority": "rollout_authority",
+        "runtime_manifest": "runtime_manifest",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -124,11 +138,93 @@ def _validate_admission_receipt(receipt: Any, route_revision: Any) -> Optional[s
 
 def _candidate_row(conn, task_id: str):
     return conn.execute(
-        "SELECT c.*, r.route_id, r.route_revision FROM strict_route_candidates c "
+        "SELECT c.*, r.route_id, r.route_revision, r.state AS revision_state FROM strict_route_candidates c "
         "JOIN strict_route_revisions r ON r.revision_id=c.revision_id "
         "WHERE c.task_id=?",
         (task_id,),
     ).fetchone()
+
+
+def _validate_commit_identity(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return "RECEIPT_SEMANTICS_INVALID"
+    sha, remote_ref = payload.get("sha"), payload.get("remote_ref")
+    if not isinstance(sha, str) or not _GIT_COMMIT_RE.fullmatch(sha):
+        return "RECEIPT_SEMANTICS_INVALID"
+    if not isinstance(remote_ref, str) or not remote_ref.strip():
+        return "RECEIPT_SEMANTICS_INVALID"
+    return None
+
+
+def _validate_completion_payload(kind: str, payload: Any, *, implementation_commit: Any = None) -> Optional[str]:
+    """Validate the canonical, replayable evidence shape before it is bound."""
+    if kind == "implementation_commit":
+        return _validate_commit_identity(payload)
+    if kind == "baseline_ancestry":
+        if not isinstance(payload, dict):
+            return "RECEIPT_SEMANTICS_INVALID"
+        baseline_sha, descendant_sha = payload.get("baseline_sha"), payload.get("descendant_sha")
+        if (
+            not isinstance(baseline_sha, str)
+            or not _GIT_COMMIT_RE.fullmatch(baseline_sha)
+            or not isinstance(descendant_sha, str)
+            or not _GIT_COMMIT_RE.fullmatch(descendant_sha)
+            or payload.get("is_ancestor") is not True
+            or not isinstance(implementation_commit, dict)
+            or descendant_sha != implementation_commit.get("sha")
+        ):
+            return "RECEIPT_SEMANTICS_INVALID"
+        return None
+    if kind == "changed_paths":
+        paths = payload.get("paths") if isinstance(payload, dict) else None
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or paths != sorted(set(paths))
+            or any(
+                not isinstance(path, str)
+                or not path
+                or path.startswith("/")
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                for path in paths
+            )
+        ):
+            return "RECEIPT_SEMANTICS_INVALID"
+        return None
+    if kind in {"focused_tests", "full_tests"}:
+        if not isinstance(payload, dict):
+            return "RECEIPT_SEMANTICS_INVALID"
+        if (
+            not isinstance(payload.get("command"), str)
+            or not payload["command"].strip()
+            or not isinstance(payload.get("output"), str)
+            or not payload["output"].strip()
+            or payload.get("exit_code") != 0
+        ):
+            return "RECEIPT_SEMANTICS_INVALID"
+        return None
+    return None
+
+
+def _active_candidate_authorization(conn, candidate, task_id: str, operation: str) -> Optional[StrictEligibilityResult]:
+    watch = conn.execute(
+        "SELECT task_id FROM strict_route_watches WHERE revision_id=? AND active=1",
+        (candidate["revision_id"],),
+    ).fetchone()
+    if (
+        candidate["state"] != "active"
+        or candidate["revision_state"] != "active"
+        or watch is None
+        or watch["task_id"] != task_id
+    ):
+        return StrictEligibilityResult(
+            False, operation, True, candidate["route_id"], candidate["candidate_id"],
+            task_id, "NOT_CURRENT_CANDIDATE",
+            active_task_id=watch["task_id"] if watch else None,
+            expected_route_revision=candidate["route_revision"],
+        )
+    return None
 
 
 def _bind_receipt(conn, candidate, kind: str, payload: Any, *, purpose: str) -> None:
@@ -202,6 +298,21 @@ def _candidate_receipt_kinds(conn, candidate) -> set[str]:
     }
 
 
+def _validate_immutable_binding(conn, candidate, kind: str, payload: Any, *, purpose: str) -> Optional[str]:
+    """Reject attempts to replace evidence already bound for this purpose."""
+    digests = {
+        row["digest"] for row in conn.execute(
+            "SELECT r.digest FROM strict_route_receipts r "
+            "JOIN strict_route_candidate_receipts b ON b.receipt_pk=r.receipt_pk "
+            "WHERE b.candidate_id=? AND b.purpose=? AND r.kind=?",
+            (candidate["candidate_id"], purpose, kind),
+        )
+    }
+    if digests and _receipt_digest(payload) not in digests:
+        return "RECEIPT_IMMUTABLE_CONFLICT"
+    return None
+
+
 def _insert_candidate(conn, kb, revision_id: str, route_id: str, *, key: str, kind: str, cycle: int, status: str, assignee: str):
     """Create one canonical strict stage inside the caller's transaction."""
     now = int(time.time())
@@ -235,6 +346,9 @@ def record_completion_receipt(conn, task_id: str, metadata: Optional[dict]) -> S
     candidate = _candidate_row(conn, task_id)
     if candidate is None:
         return StrictEligibilityResult(True, "complete", False, task_id=task_id)
+    authorization = _active_candidate_authorization(conn, candidate, task_id, "complete")
+    if authorization is not None:
+        return authorization
     metadata = metadata if isinstance(metadata, dict) else {}
     if candidate["stage_kind"] == "developer":
         fields = {
@@ -250,6 +364,23 @@ def record_completion_receipt(conn, task_id: str, metadata: Optional[dict]) -> S
                 False, "complete", True, candidate["route_id"],
                 candidate["candidate_id"], task_id, "MISSING_RECEIPT", missing,
             )
+        for kind, value in fields.items():
+            refusal_code = _validate_completion_payload(
+                kind, value, implementation_commit=fields["implementation_commit"],
+            )
+            if refusal_code:
+                return StrictEligibilityResult(
+                    False, "complete", True, candidate["route_id"],
+                    candidate["candidate_id"], task_id, refusal_code, (kind,),
+                )
+            refusal_code = _validate_immutable_binding(
+                conn, candidate, kind, value, purpose="completion",
+            )
+            if refusal_code:
+                return StrictEligibilityResult(
+                    False, "complete", True, candidate["route_id"],
+                    candidate["candidate_id"], task_id, refusal_code, (kind,),
+                )
         for kind, value in fields.items():
             _bind_receipt(conn, candidate, kind, value, purpose="completion")
     elif candidate["stage_kind"] == "qa":
@@ -296,7 +427,10 @@ def record_completion_receipt(conn, task_id: str, metadata: Optional[dict]) -> S
 def record_strict_route_receipt(conn, request: dict, *, board: Optional[str] = None) -> StrictEligibilityResult:
     """Persist one externally supplied immutable receipt without a status transition."""
     from hermes_cli import kanban_db as kb
-    required = ("schema_version", "request_id", "board", "task_id", "receipt_kind", "immutable_digest", "issuer_witness")
+    required = (
+        "schema_version", "request_id", "board", "task_id", "receipt_kind",
+        "receipt_purpose", "immutable_digest", "issuer_witness",
+    )
     if not isinstance(request, dict) or any(not request.get(key) for key in required):
         return StrictEligibilityResult(False, "record_receipt", True, reason_code="MISSING_FIELD")
     if request["schema_version"] != SCHEMA_VERSION:
@@ -309,6 +443,23 @@ def record_strict_route_receipt(conn, request: dict, *, board: Optional[str] = N
         candidate = _candidate_row(conn, request["task_id"])
         if candidate is None:
             return StrictEligibilityResult(False, "record_receipt", False, task_id=request["task_id"], reason_code="OPERATION_NOT_ALLOWED")
+        authorization = _active_candidate_authorization(
+            conn, candidate, request["task_id"], "record_receipt",
+        )
+        if authorization is not None:
+            return authorization
+        stage_permissions = _EXTERNAL_RECEIPT_PERMISSIONS.get(candidate["stage_kind"], {})
+        permitted_purpose = stage_permissions.get(request["receipt_kind"])
+        if permitted_purpose is None:
+            return StrictEligibilityResult(
+                False, "record_receipt", True, candidate["route_id"],
+                candidate["candidate_id"], request["task_id"], "RECEIPT_KIND_NOT_PERMITTED",
+            )
+        if request["receipt_purpose"] != permitted_purpose:
+            return StrictEligibilityResult(
+                False, "record_receipt", True, candidate["route_id"],
+                candidate["candidate_id"], request["task_id"], "RECEIPT_PURPOSE_NOT_PERMITTED",
+            )
         witness_code = _validate_admission_receipt(
             request["issuer_witness"], candidate["route_revision"],
         )
@@ -326,7 +477,32 @@ def record_strict_route_receipt(conn, request: dict, *, board: Optional[str] = N
                 False, "record_receipt", True, candidate["route_id"],
                 candidate["candidate_id"], request["task_id"], "RECEIPT_MISMATCH",
             )
-        _bind_receipt(conn, candidate, request["receipt_kind"], request.get("payload"), purpose="external")
+        refusal_code = _validate_completion_payload(
+            request["receipt_kind"], request.get("payload"),
+            implementation_commit=(
+                request.get("payload")
+                if request["receipt_kind"] == "implementation_commit"
+                else _candidate_receipt_payload(conn, candidate, "implementation_commit")
+            ),
+        )
+        if refusal_code:
+            return StrictEligibilityResult(
+                False, "record_receipt", True, candidate["route_id"],
+                candidate["candidate_id"], request["task_id"], refusal_code,
+            )
+        refusal_code = _validate_immutable_binding(
+            conn, candidate, request["receipt_kind"], request.get("payload"),
+            purpose=request["receipt_purpose"],
+        )
+        if refusal_code:
+            return StrictEligibilityResult(
+                False, "record_receipt", True, candidate["route_id"],
+                candidate["candidate_id"], request["task_id"], refusal_code,
+            )
+        _bind_receipt(
+            conn, candidate, request["receipt_kind"], request.get("payload"),
+            purpose=request["receipt_purpose"],
+        )
         kb._append_event(conn, request["task_id"], "strict_route_receipt_recorded", {
             "request_id": request["request_id"], "route_id": candidate["route_id"],
             "candidate_id": candidate["candidate_id"], "receipt_kind": request["receipt_kind"],
