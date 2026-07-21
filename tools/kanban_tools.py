@@ -1157,11 +1157,17 @@ def _handle_strict_route_record_receipt(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             result = kb.record_strict_route_receipt(conn, request, board=board)
-            return json.dumps({
+            payload = {
                 "ok": result.allowed, "task_id": result.task_id,
                 "route_id": result.route_id, "candidate_id": result.candidate_id,
                 "refusal_code": result.reason_code,
-            })
+            }
+            if not result.allowed:
+                payload["refusal"] = {
+                    "code": result.reason_code or "OPERATION_NOT_ALLOWED",
+                    "request_id": request.get("request_id"),
+                }
+            return json.dumps(payload)
         finally:
             conn.close()
     except Exception as e:

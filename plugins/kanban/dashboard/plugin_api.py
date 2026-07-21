@@ -924,6 +924,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
             elif s in ("todo", "triage", "scheduled"):
+                strict = kanban_db.is_current_eligible(conn, task_id, "dashboard_status")
+                if strict.strict:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "schema_version": "strict-route/v1",
+                            "code": strict.reason_code or "OPERATION_NOT_ALLOWED",
+                            "message": "strict route status changes require a guarded native lifecycle operation",
+                            "task_id": task_id,
+                        },
+                    )
                 ok = _set_status_direct(conn, task_id, s)
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")

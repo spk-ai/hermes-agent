@@ -8,10 +8,45 @@ Verifies:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
 import pytest
+
+
+def _strict_route_request():
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1",
+            "receipt_id": receipt_id,
+            "kind": kind,
+            "payload": payload,
+            "digest": hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "current": True,
+            "route_revision": "1",
+        }
+
+    return {
+        "schema_version": "strict-route/v1",
+        "request_id": "tools-strict-route",
+        "route": {
+            "governing_board": "default",
+            "governing_source_id": "tools-detector",
+            "root_task_id": "tools-root",
+            "route_revision": "1",
+            "requirements_digest": "requirements",
+            "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False},
+        },
+        "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "tools/developer/0"},
+        "receipts": [
+            receipt("detector", "detector_source", {"source": "tools-detector"}),
+            receipt("risk", "risk_classification", {"external": False, "credentials": False, "payment": False, "production_risk": False}),
+            receipt("plan", "planning_materialization", {"plan": "tools"}),
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +229,43 @@ def test_show_explicit_task_id(worker_env):
     out = kt._handle_show({"task_id": other})
     d = json.loads(out)
     assert d["task"]["id"] == other
+
+
+def test_strict_route_receipt_tool_refuses_noncurrent_issuer_witness(worker_env):
+    """External receipt admission must propagate a typed currentness refusal."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        admitted = kb.reconcile_strict_route(conn, _strict_route_request())
+        task_id = admitted.candidates["developer.0"]["task_id"]
+    payload = {"commit": "a" * 40}
+    witness = {
+        "schema_version": "strict-route/v1",
+        "receipt_id": "issuer-witness",
+        "kind": "implementation_commit",
+        "payload": payload,
+        "digest": hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "current": False,
+        "route_revision": "1",
+    }
+    request = {
+        "schema_version": "strict-route/v1",
+        "request_id": "external-receipt",
+        "board": "default",
+        "task_id": task_id,
+        "receipt_kind": "implementation_commit",
+        "payload": payload,
+        "immutable_digest": witness["digest"],
+        "issuer_witness": witness,
+    }
+
+    result = json.loads(kt._handle_strict_route_record_receipt({"request": request}))
+
+    assert result["ok"] is False
+    assert result["refusal"]["code"] == "RECEIPT_NOT_CURRENT"
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
