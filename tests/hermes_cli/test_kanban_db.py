@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -220,6 +221,93 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.status == "ready"
     assert t.assignee == "alice"
     assert t.workspace_kind == "scratch"
+
+
+def _control_plane_source(**overrides):
+    source = {
+        "authority_kind": "control_plane_detector",
+        "board": "sdlc-control-plane",
+        "task_id": "t_87e4d45f",
+        "acceptance_criteria": ["preserve governing source", "reject product substitution"],
+        "source_snapshot_ref": "snapshot:control-plane-root-v1",
+        "scope": {
+            "allowed_path_classes": ["native-hermes-kanban"],
+            "prohibited_domains": ["product", "jira"],
+        },
+        "route_revision": 1,
+    }
+    source.update(overrides)
+    return source
+
+
+def test_protected_root_stores_canonical_governing_source_and_non_governing_evidence(kanban_home):
+    source = _control_plane_source()
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="Control-plane repair",
+            governing_source=source,
+            non_governing_evidence={"clawd_ticket": "CLAWD-37", "product_board": "product"},
+        )
+        root = kb.get_task(conn, root_id)
+
+    assert root.governing_source["board"] == "sdlc-control-plane"
+    assert root.governing_source["task_id"] == "t_87e4d45f"
+    assert root.governing_source["criteria_digest"] == kb.criteria_digest(source["acceptance_criteria"])
+    assert root.non_governing_evidence == {
+        "clawd_ticket": "CLAWD-37", "product_board": "product"
+    }
+
+
+def test_protected_continuation_inherits_authority_and_rejects_product_override(kanban_home):
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn, title="Control-plane repair", governing_source=_control_plane_source()
+        )
+        continuation_id = kb.create_governed_continuation(
+            conn, parent_task_id=root_id, lane="audit", title="Audit", assignee="dodik"
+        )
+        root = kb.get_task(conn, root_id)
+        continuation = kb.get_task(conn, continuation_id)
+        with pytest.raises(kb.GoverningSourceMismatch):
+            kb.create_governed_continuation(
+                conn,
+                parent_task_id=continuation_id,
+                lane="repair",
+                title="Wrong repair",
+                assignee="developer",
+                governing_source=_control_plane_source(
+                    board="product", task_id="CLAWD-37", route_revision=2
+                ),
+            )
+        events = kb.list_events(conn, continuation_id)
+
+    assert continuation.governing_source == root.governing_source
+    assert any(e.kind == "governing_source_mismatch" for e in events)
+
+
+def test_dispatch_fails_closed_when_persisted_governing_source_is_tampered(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="Control-plane repair", assignee="developer",
+            governing_source=_control_plane_source(),
+        )
+        # Simulate a corrupt/out-of-band write: the digest stays frozen while
+        # mutable serialized criteria are changed. The dispatcher must block
+        # before it can claim or spawn the ready task.
+        source = _control_plane_source(acceptance_criteria=["substituted product authority"])
+        source["criteria_digest"] = kb.criteria_digest(["preserve governing source"])
+        conn.execute(
+            "UPDATE task_governing_sources SET source_json = ? WHERE task_id = ?",
+            (json.dumps(source), task_id),
+        )
+        result = kb.dispatch_once(conn, dry_run=True)
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert result.spawned == []
+    assert task is not None and task.status == "blocked"
+    assert [event.kind for event in events].count("governing_source_mismatch") == 1
 
 
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):

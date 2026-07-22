@@ -182,6 +182,35 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_create_and_show_preserve_typed_governing_source(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+
+    source = {
+        "authority_kind": "control_plane_detector",
+        "board": "sdlc-control-plane",
+        "task_id": "t_87e4d45f",
+        "acceptance_criteria": ["preserve authority"],
+        "source_snapshot_ref": "snapshot:control-plane-v1",
+        "scope": {"allowed_path_classes": ["native"], "prohibited_domains": ["product"]},
+        "route_revision": 1,
+    }
+    root = json.loads(kt._handle_create({
+        "title": "Control root", "assignee": "architect",
+        "governing_source": source,
+        "non_governing_evidence": {"clawd_ticket": "CLAWD-37"},
+    }))
+    child = json.loads(kt._handle_create({
+        "title": "Audit", "assignee": "dodik", "parents": [root["task_id"]],
+        "continuation_lane": "audit",
+    }))
+    shown = json.loads(kt._handle_show({"task_id": child["task_id"]}))
+
+    assert root["ok"] and child["ok"]
+    assert shown["task"]["governing_source"]["task_id"] == "t_87e4d45f"
+    assert shown["task"]["non_governing_evidence"] == {"clawd_ticket": "CLAWD-37"}
+
+
 def test_show_explicit_task_id(worker_env):
     """Peek at a different task than the one in env."""
     from hermes_cli import kanban_db as kb
