@@ -14873,7 +14873,12 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        # Kanban handlers deliberately return shell-style exit codes. Honor
+        # those codes at the process boundary so rejected protected routes
+        # cannot be mistaken for successful CLI mutations by automation.
+        if args.command == "kanban" and isinstance(result, int):
+            raise SystemExit(result)
     else:
         parser.print_help()
 

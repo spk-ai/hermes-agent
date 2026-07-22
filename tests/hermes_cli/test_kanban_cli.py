@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -114,6 +116,69 @@ def test_run_slash_create_and_show_governing_source(kanban_home):
 
     assert "IMMUTABLE GOVERNING SOURCE" in shown
     assert "t_87e4d45f" in shown
+
+
+def test_cli_rejects_changed_protected_authority_with_nonzero_exit(kanban_home):
+    """A rejected protected continuation must be visible to shell callers."""
+    source = {
+        "authority_kind": "control_plane_detector",
+        "board": "sdlc-control-plane",
+        "task_id": "t_87e4d45f",
+        "acceptance_criteria": ["preserve authority"],
+        "source_snapshot_ref": "snapshot:cli-v1",
+        "scope": {"allowed_path_classes": ["native"], "prohibited_domains": ["product"]},
+        "route_revision": 1,
+    }
+    changed_source = {**source, "board": "product", "route_revision": 2}
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="protected audit",
+            assignee="qa",
+            governing_source=source,
+        )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "create",
+            "bad product repair",
+            "--assignee",
+            "qa",
+            "--parent",
+            parent_id,
+            "--continuation-lane",
+            "product-repair",
+            "--governing-source",
+            json.dumps(changed_source),
+            "--json",
+        ],
+        cwd=repo_root,
+        env={
+            **os.environ,
+            "HERMES_HOME": str(kanban_home),
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, (str(repo_root), os.environ.get("PYTHONPATH")))
+            ),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "protected governing authority must originate on sdlc-control-plane" in result.stderr
+    with kb.connect() as conn:
+        assert [task.id for task in kb.list_tasks(conn)] == [parent_id]
+        assert kb.child_ids(conn, parent_id) == []
+        assert any(
+            event.kind == "governing_source_mismatch"
+            for event in kb.list_events(conn, parent_id)
+        )
 
 
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
