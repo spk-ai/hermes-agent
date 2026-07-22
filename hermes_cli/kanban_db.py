@@ -123,6 +123,10 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_GOVERNING_SOURCE_KINDS = {
+    "control_plane_detector",
+    "jira_control_plane_incident",
+}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -915,6 +919,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Immutable authority is stored separately from mutable task prose and
+    # scheduling links. ``None`` preserves legacy / ordinary-card behavior.
+    governing_source: Optional[dict[str, Any]] = None
+    non_governing_evidence: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1000,6 +1008,133 @@ class Task:
                 else 0
             ),
         )
+
+
+class GoverningSourceMismatch(ValueError):
+    """A protected continuation attempted to change immutable authority."""
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def criteria_digest(criteria: Any) -> str:
+    """Return the frozen SHA-256 digest for ordered acceptance criteria."""
+    return hashlib.sha256(_canonical_json(criteria).encode("utf-8")).hexdigest()
+
+
+def _normalize_governing_source(source: Any) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        raise GoverningSourceMismatch("governing_source must be an object")
+    required = {
+        "authority_kind", "board", "task_id", "acceptance_criteria",
+        "source_snapshot_ref", "scope", "route_revision",
+    }
+    missing = sorted(required - set(source))
+    if missing:
+        raise GoverningSourceMismatch(
+            f"governing_source missing required fields: {', '.join(missing)}"
+        )
+    kind = str(source["authority_kind"]).strip()
+    board = str(source["board"]).strip()
+    task_id = str(source["task_id"]).strip()
+    criteria = source["acceptance_criteria"]
+    snapshot = str(source["source_snapshot_ref"]).strip()
+    scope = source["scope"]
+    try:
+        revision = int(source["route_revision"])
+    except (TypeError, ValueError) as exc:
+        raise GoverningSourceMismatch("route_revision must be a positive integer") from exc
+    if kind not in VALID_GOVERNING_SOURCE_KINDS:
+        raise GoverningSourceMismatch(f"unknown authority_kind: {kind!r}")
+    if not board or not task_id or not snapshot or revision < 1:
+        raise GoverningSourceMismatch("authority board/task, snapshot, and route_revision are required")
+    if board != "sdlc-control-plane":
+        raise GoverningSourceMismatch(
+            "protected governing authority must originate on sdlc-control-plane"
+        )
+    if not isinstance(criteria, list) or not criteria or any(
+        not isinstance(item, str) or not item.strip() for item in criteria
+    ):
+        raise GoverningSourceMismatch("acceptance_criteria must be a non-empty ordered string list")
+    if not isinstance(scope, dict):
+        raise GoverningSourceMismatch("scope must be an object")
+    allowed = scope.get("allowed_path_classes")
+    prohibited = scope.get("prohibited_domains")
+    if not isinstance(allowed, list) or not allowed or not isinstance(prohibited, list):
+        raise GoverningSourceMismatch(
+            "scope requires allowed_path_classes and prohibited_domains lists"
+        )
+    normalized = {
+        "authority_kind": kind,
+        "board": board,
+        "task_id": task_id,
+        "acceptance_criteria": list(criteria),
+        "criteria_digest": criteria_digest(criteria),
+        "source_snapshot_ref": snapshot,
+        "scope": scope,
+        "route_revision": revision,
+    }
+    return normalized
+
+
+def _governing_source_for_task(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[dict], Optional[dict]]:
+    row = conn.execute(
+        "SELECT source_json, non_governing_evidence FROM task_governing_sources WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None, None
+    try:
+        source = _normalize_governing_source(json.loads(row["source_json"]))
+        evidence = json.loads(row["non_governing_evidence"]) if row["non_governing_evidence"] else None
+    except (json.JSONDecodeError, GoverningSourceMismatch) as exc:
+        raise GoverningSourceMismatch(f"stored governing source is invalid: {exc}") from exc
+    return source, evidence if isinstance(evidence, dict) else None
+
+
+def _record_governing_source_mismatch(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    """Fail closed with one actionable, sticky protocol block."""
+    with write_txn(conn):
+        duplicate = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'governing_source_mismatch' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if duplicate:
+            return
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
+            "block_kind = 'needs_input' WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(conn, task_id, "governing_source_mismatch", {"reason": reason})
+
+
+def validate_governing_source_for_dispatch(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether a task may cross the native dispatch boundary.
+
+    Ordinary and legacy cards remain compatible. Protected cards validate their
+    immutable serialized envelope and persisted digest before any claim or
+    spawn. Invalid state is a sticky protocol block, never a best-effort
+    fallback to task text, links, Jira identifiers, or product evidence.
+    """
+    row = conn.execute(
+        "SELECT source_json, criteria_digest, route_revision FROM task_governing_sources "
+        "WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return True
+    try:
+        source = _normalize_governing_source(json.loads(row["source_json"]))
+        if source["criteria_digest"] != row["criteria_digest"]:
+            raise GoverningSourceMismatch("stored criteria digest differs from canonical criteria")
+        if source["route_revision"] != int(row["route_revision"]):
+            raise GoverningSourceMismatch("stored route revision differs from canonical source")
+    except (ValueError, TypeError, json.JSONDecodeError, GoverningSourceMismatch) as exc:
+        _record_governing_source_mismatch(conn, task_id, str(exc))
+        return False
+    return True
 
 
 @dataclass
@@ -1202,6 +1337,32 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Immutable governing authority for protected control-plane routes. This is
+-- not derived from mutable task bodies, comments, events, or task_links.
+CREATE TABLE IF NOT EXISTS task_governing_sources (
+    task_id                TEXT PRIMARY KEY,
+    authority_kind         TEXT NOT NULL,
+    authority_board        TEXT NOT NULL,
+    authority_task_id      TEXT NOT NULL,
+    criteria_digest        TEXT NOT NULL,
+    route_revision         INTEGER NOT NULL,
+    source_json            TEXT NOT NULL,
+    non_governing_evidence TEXT,
+    created_at             INTEGER NOT NULL
+);
+
+-- A protected continuation is materialized once per parent/lane. Its source
+-- is copied from the parent in the same write transaction.
+CREATE TABLE IF NOT EXISTS governing_source_continuations (
+    parent_task_id TEXT NOT NULL,
+    lane           TEXT NOT NULL,
+    child_task_id  TEXT NOT NULL UNIQUE,
+    criteria_digest TEXT NOT NULL,
+    route_revision INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (parent_task_id, lane)
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1270,6 +1431,8 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_governing_source_tuple
+    ON task_governing_sources(authority_board, authority_task_id, criteria_digest);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -2408,6 +2571,8 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    governing_source: Optional[dict[str, Any]] = None,
+    non_governing_evidence: Optional[dict[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2448,6 +2613,12 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    normalized_source = (
+        _normalize_governing_source(governing_source)
+        if governing_source is not None else None
+    )
+    if non_governing_evidence is not None and not isinstance(non_governing_evidence, dict):
+        raise ValueError("non_governing_evidence must be an object")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2667,6 +2838,28 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if normalized_source is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO task_governing_sources (
+                            task_id, authority_kind, authority_board, authority_task_id,
+                            criteria_digest, route_revision, source_json,
+                            non_governing_evidence, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            normalized_source["authority_kind"],
+                            normalized_source["board"],
+                            normalized_source["task_id"],
+                            normalized_source["criteria_digest"],
+                            normalized_source["route_revision"],
+                            _canonical_json(normalized_source),
+                            _canonical_json(non_governing_evidence)
+                            if non_governing_evidence is not None else None,
+                            now,
+                        ),
+                    )
                 _append_event(
                     conn,
                     task_id,
@@ -2679,6 +2872,14 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "governing_source": (
+                            {
+                                "authority_kind": normalized_source["authority_kind"],
+                                "board": normalized_source["board"],
+                                "task_id": normalized_source["task_id"],
+                                "criteria_digest": normalized_source["criteria_digest"],
+                            } if normalized_source else None
+                        ),
                     },
                 )
             return task_id
@@ -2705,7 +2906,113 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    return Task.from_row(row) if row else None
+    if not row:
+        return None
+    task = Task.from_row(row)
+    task.governing_source, task.non_governing_evidence = _governing_source_for_task(conn, task_id)
+    return task
+
+
+def create_governed_continuation(
+    conn: sqlite3.Connection,
+    *,
+    parent_task_id: str,
+    lane: str,
+    title: str,
+    assignee: Optional[str] = None,
+    body: Optional[str] = None,
+    governing_source: Optional[dict[str, Any]] = None,
+    non_governing_evidence: Optional[dict[str, Any]] = None,
+    **task_kwargs: Any,
+) -> str:
+    """Create an idempotent protected continuation by copying parent authority.
+
+    A caller may supply the same envelope for a rendered-mirror check, but it
+    can never replace the stored parent source. Any mismatch blocks the parent
+    before a child, link, claim, or worker can be created.
+    """
+    lane = str(lane).strip()
+    if not lane:
+        raise ValueError("continuation lane is required")
+    parent = get_task(conn, parent_task_id)
+    if parent is None:
+        raise ValueError(f"unknown parent task {parent_task_id}")
+    if parent.governing_source is None:
+        raise GoverningSourceMismatch("parent has no protected governing source")
+    try:
+        candidate = _normalize_governing_source(governing_source) if governing_source else None
+    except GoverningSourceMismatch as exc:
+        _record_governing_source_mismatch(conn, parent_task_id, str(exc))
+        raise
+    if candidate is not None and candidate != parent.governing_source:
+        reason = "candidate governing source differs from immutable parent envelope"
+        _record_governing_source_mismatch(conn, parent_task_id, reason)
+        raise GoverningSourceMismatch(reason)
+    existing = conn.execute(
+        "SELECT child_task_id, criteria_digest, route_revision "
+        "FROM governing_source_continuations WHERE parent_task_id = ? AND lane = ?",
+        (parent_task_id, lane),
+    ).fetchone()
+    if existing:
+        if (
+            existing["criteria_digest"] == parent.governing_source["criteria_digest"]
+            and int(existing["route_revision"]) == parent.governing_source["route_revision"]
+        ):
+            return existing["child_task_id"]
+        reason = "stored continuation signature differs from immutable parent envelope"
+        _record_governing_source_mismatch(conn, parent_task_id, reason)
+        raise GoverningSourceMismatch(reason)
+    # The continuation receipt is the only permitted idempotency identity for
+    # protected descendants; a caller-supplied generic key cannot select a
+    # second authority route or conflict with the canonical receipt.
+    task_kwargs.pop("idempotency_key", None)
+    task_kwargs.pop("parents", None)
+    # Evidence is explicitly non-governing, but it remains lossless across a
+    # protected route unless the materializer appends/replaces it with another
+    # typed evidence object. It never participates in authority equivalence.
+    effective_evidence = (
+        non_governing_evidence
+        if non_governing_evidence is not None else parent.non_governing_evidence
+    )
+    child_id = create_task(
+        conn,
+        title=title,
+        body=body,
+        assignee=assignee,
+        parents=(parent_task_id,),
+        governing_source=parent.governing_source,
+        non_governing_evidence=effective_evidence,
+        idempotency_key=(
+            f"governing:{parent_task_id}:{lane}:"
+            f"{parent.governing_source['criteria_digest']}:"
+            f"{parent.governing_source['route_revision']}"
+        ),
+        **task_kwargs,
+    )
+    with write_txn(conn):
+        try:
+            conn.execute(
+                """
+                INSERT INTO governing_source_continuations (
+                    parent_task_id, lane, child_task_id, criteria_digest, route_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    parent_task_id, lane, child_id,
+                    parent.governing_source["criteria_digest"],
+                    parent.governing_source["route_revision"], int(time.time()),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT child_task_id FROM governing_source_continuations "
+                "WHERE parent_task_id = ? AND lane = ?",
+                (parent_task_id, lane),
+            ).fetchone()
+            if existing:
+                return existing["child_task_id"]
+            raise
+    return child_id
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -7536,6 +7843,11 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if not validate_governing_source_for_dispatch(conn, row["id"]):
+            # The validator recorded the single typed protocol block and made
+            # no claim/spawn side effects. Do not treat this as an ordinary
+            # dependency wait or a retryable worker failure.
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -8368,6 +8680,24 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    if task.governing_source:
+        source = task.governing_source
+        lines.append("## IMMUTABLE GOVERNING SOURCE")
+        lines.append(
+            f"{source['authority_kind']}:{source['board']}:{source['task_id']} "
+            f"(criteria SHA-256: {source['criteria_digest']}, route revision: {source['route_revision']})"
+        )
+        lines.append(f"Scope: {_canonical_json(source['scope'])}")
+        lines.append("Acceptance criteria:")
+        lines.extend(f"- {criterion}" for criterion in source["acceptance_criteria"])
+        lines.append("")
+        lines.append("## NON-GOVERNING PRODUCT CONTEXT/EVIDENCE")
+        if task.non_governing_evidence:
+            lines.append(_cap(_canonical_json(task.non_governing_evidence), _CTX_MAX_FIELD_BYTES))
+        else:
+            lines.append("(none)")
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")

@@ -80,6 +80,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "governing_source": t.governing_source,
+        "non_governing_evidence": t.non_governing_evidence,
     }
 
 
@@ -364,8 +366,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
                           help="Initial card status. Use 'blocked' for cards "
-                               "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                           "that require immediate human ops (R3 gate) "
+                           "to skip the brief running-to-blocked transition.")
+    p_create.add_argument(
+        "--governing-source", default=None, metavar="JSON",
+        help="Immutable protected control-plane authority envelope as JSON.",
+    )
+    p_create.add_argument(
+        "--non-governing-evidence", default=None, metavar="JSON",
+        help="Typed reproduction/product evidence JSON; never authoritative.",
+    )
+    p_create.add_argument(
+        "--continuation-lane", default=None,
+        help="Materialize a protected continuation from exactly one --parent.",
+    )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1325,9 +1339,19 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        governing_source = json.loads(args.governing_source) if args.governing_source else None
+        non_governing_evidence = (
+            json.loads(args.non_governing_evidence) if args.non_governing_evidence else None
+        )
+    except json.JSONDecodeError as exc:
+        print(f"kanban: governing/evidence JSON: {exc}", file=sys.stderr)
+        return 2
+    if args.continuation_lane and len(args.parent or ()) != 1:
+        print("kanban: --continuation-lane requires exactly one --parent", file=sys.stderr)
+        return 2
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
+        create_kwargs = dict(
             title=args.title,
             body=args.body,
             assignee=args.assignee,
@@ -1348,6 +1372,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
+        if args.continuation_lane:
+            task_id = kb.create_governed_continuation(
+                conn, parent_task_id=args.parent[0], lane=args.continuation_lane,
+                governing_source=governing_source,
+                non_governing_evidence=non_governing_evidence,
+                **create_kwargs,
+            )
+        else:
+            task_id = kb.create_task(
+                conn, governing_source=governing_source,
+                non_governing_evidence=non_governing_evidence, **create_kwargs,
+            )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
@@ -1515,6 +1551,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
+    if task.governing_source:
+        source = task.governing_source
+        print("\nIMMUTABLE GOVERNING SOURCE:")
+        print(
+            f"  {source['authority_kind']}:{source['board']}:{source['task_id']} "
+            f"(criteria SHA-256 {source['criteria_digest']}, revision {source['route_revision']})"
+        )
+        print(f"  scope: {kb._canonical_json(source['scope'])}")
+        print("NON-GOVERNING PRODUCT CONTEXT/EVIDENCE:")
+        print(f"  {task.non_governing_evidence or '(none)'}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:

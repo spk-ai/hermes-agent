@@ -91,6 +91,31 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_create_and_show_governing_source(kanban_home):
+    import shlex
+
+    source = {
+        "authority_kind": "control_plane_detector",
+        "board": "sdlc-control-plane",
+        "task_id": "t_87e4d45f",
+        "acceptance_criteria": ["preserve authority"],
+        "source_snapshot_ref": "snapshot:cli-v1",
+        "scope": {"allowed_path_classes": ["native"], "prohibited_domains": ["product"]},
+        "route_revision": 1,
+    }
+    out = kc.run_slash(
+        "create control --assignee architect --governing-source " + shlex.quote(json.dumps(source))
+    )
+    import re
+    match = re.search(r"Created\s+(t_[a-f0-9]+)", out)
+    assert match, out
+    task_id = match.group(1)
+    shown = kc.run_slash(f"show {task_id}")
+
+    assert "IMMUTABLE GOVERNING SOURCE" in shown
+    assert "t_87e4d45f" in shown
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()

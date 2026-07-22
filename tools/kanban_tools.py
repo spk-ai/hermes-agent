@@ -398,6 +398,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "governing_source": t.governing_source,
+                    "non_governing_evidence": t.non_governing_evidence,
                 }
 
             def _run_dict(r):
@@ -900,6 +902,11 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    governing_source = args.get("governing_source")
+    non_governing_evidence = args.get("non_governing_evidence")
+    continuation_lane = args.get("continuation_lane")
+    if continuation_lane and len(parents) != 1:
+        return tool_error("continuation_lane requires exactly one protected parent")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -917,33 +924,30 @@ def _handle_create(args: dict, **kw) -> str:
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
                             project_id = _self_task.project_id
-            new_tid = kb.create_task(
-                conn,
-                title=str(title).strip(),
-                body=body,
-                assignee=str(assignee),
-                parents=tuple(parents),
-                tenant=tenant,
-                priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
-                workspace_path=workspace_path,
-                branch_name=branch_name,
-                project_id=project_id,
-                triage=triage,
-                idempotency_key=idempotency_key,
-                max_runtime_seconds=(
-                    int(max_runtime_seconds)
-                    if max_runtime_seconds is not None else None
-                ),
-                skills=skills,
-                goal_mode=goal_mode,
-                goal_max_turns=(
-                    int(goal_max_turns) if goal_max_turns is not None else None
-                ),
-                initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
-                session_id=session_id,
-            )
+            create_kwargs = {
+                "title": str(title).strip(), "body": body, "assignee": str(assignee),
+                "tenant": tenant, "priority": int(priority) if priority is not None else 0,
+                "workspace_kind": str(workspace_kind), "workspace_path": workspace_path,
+                "branch_name": branch_name, "project_id": project_id, "triage": triage,
+                "idempotency_key": idempotency_key,
+                "max_runtime_seconds": int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                "skills": skills, "goal_mode": goal_mode,
+                "goal_max_turns": int(goal_max_turns) if goal_max_turns is not None else None,
+                "initial_status": str(initial_status),
+                "created_by": os.environ.get("HERMES_PROFILE") or "worker",
+                "session_id": session_id,
+            }
+            if continuation_lane:
+                new_tid = kb.create_governed_continuation(
+                    conn, parent_task_id=str(parents[0]), lane=str(continuation_lane),
+                    governing_source=governing_source,
+                    non_governing_evidence=non_governing_evidence, **create_kwargs,
+                )
+            else:
+                new_tid = kb.create_task(
+                    conn, parents=tuple(parents), governing_source=governing_source,
+                    non_governing_evidence=non_governing_evidence, **create_kwargs,
+                )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1443,6 +1447,18 @@ KANBAN_CREATE_SCHEMA = {
                     "all the researcher task ids when creating a "
                     "synthesizer task."
                 ),
+            },
+            "governing_source": {
+                "type": "object",
+                "description": "Immutable authority envelope for a protected control-plane root. Include authority_kind, board, task_id, ordered acceptance_criteria, source_snapshot_ref, scope, and route_revision."
+            },
+            "non_governing_evidence": {
+                "type": "object",
+                "description": "Typed reproduction/product context. This is evidence only and never selects scope or acceptance criteria."
+            },
+            "continuation_lane": {
+                "type": "string",
+                "description": "For a protected parent only: materialize the named continuation by immutable inheritance. Requires exactly one parent and rejects authority overrides."
             },
             "tenant": {
                 "type": "string",
