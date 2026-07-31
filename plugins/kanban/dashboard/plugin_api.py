@@ -834,6 +834,45 @@ class UpdateTaskBody(BaseModel):
     metadata: Optional[dict] = None
 
 
+class StrictRouteReconcileBody(BaseModel):
+    request: dict
+
+
+@router.post("/strict-routes/reconcile")
+def reconcile_strict_route(
+    payload: StrictRouteReconcileBody,
+    board: Optional[str] = Query(None),
+):
+    """Delegate strict-route admission to the native DB authority."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        result = kanban_db.reconcile_strict_route(conn, payload.request, board=board)
+        if not result.ok:
+            refusal = result.refusal
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "schema_version": "strict-route/v1",
+                    "code": refusal.code if refusal else "OPERATION_NOT_ALLOWED",
+                    "message": refusal.message if refusal else "strict route refused",
+                    "request_id": refusal.request_id if refusal else payload.request.get("request_id"),
+                },
+            )
+        return {
+            "ok": True,
+            "schema_version": "strict-route/v1",
+            "replayed": result.replayed,
+            "route": result.route,
+            "candidates": result.candidates,
+            "execution_links": result.execution_links,
+            "active_watch": result.active_watch,
+            "cardinality": result.cardinality,
+        }
+    finally:
+        conn.close()
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -885,6 +924,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
             elif s in ("todo", "triage", "scheduled"):
+                strict = kanban_db.is_current_eligible(conn, task_id, "dashboard_status")
+                if strict.strict:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "schema_version": "strict-route/v1",
+                            "code": strict.reason_code or "OPERATION_NOT_ALLOWED",
+                            "message": "strict route status changes require a guarded native lifecycle operation",
+                            "task_id": task_id,
+                        },
+                    )
                 ok = _set_status_direct(conn, task_id, s)
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
@@ -1013,6 +1063,11 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        strict = kanban_db.is_current_eligible(conn, task_id, "dashboard_status")
+        if strict.strict:
+            # Strict routes have an immutable ledger and typed lifecycle
+            # receipts; drag/drop must use a guarded native verb instead.
             return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.

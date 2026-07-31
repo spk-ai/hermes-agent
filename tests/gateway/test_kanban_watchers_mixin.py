@@ -7,9 +7,14 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _active_watch_runtime_manifests,
+)
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -67,3 +72,87 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     h3, st3 = _acquire_singleton_lock(lock)
     assert st3 == "held" and h3 is not None
     _release_singleton_lock(h3)
+
+
+def test_active_watch_runtime_manifest_excludes_pre_rollout_candidate(tmp_path, monkeypatch):
+    """A developer watch is not rollout authority and cannot create a manifest."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.discard(str(kb.kanban_db_path().resolve()))
+    with kb.connect() as conn:
+        def receipt(receipt_id, kind, payload):
+            return {
+                "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+                "kind": kind, "payload": payload,
+                "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                "current": True, "route_revision": "1",
+            }
+
+        result = kb.reconcile_strict_route(conn, {
+            "schema_version": "strict-route/v1", "request_id": "watcher-manifest",
+            "route": {"governing_board": "default", "governing_source_id": "watcher", "root_task_id": "root", "route_revision": "1", "requirements_digest": "requirements", "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False}},
+            "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "watcher/developer/0"},
+            "receipts": [receipt("detector", "detector_source", {"source": "watcher"}), receipt("risk", "risk_classification", {"external": False, "credentials": False, "payment": False, "production_risk": False}), receipt("plan", "planning_materialization", {"plan": "watcher"})],
+        })
+        assert result.ok is True
+        assert result.route is not None
+        manifests = _active_watch_runtime_manifests(conn)
+
+        assert manifests == []
+        assert conn.execute(
+            "SELECT COUNT(*) FROM strict_route_candidate_receipts "
+            "WHERE purpose='runtime_manifest'"
+        ).fetchone()[0] == 0
+
+
+def test_active_watch_runtime_manifest_is_persisted_for_authorized_rollout(tmp_path, monkeypatch):
+    """The gateway records its observed module boundary only for rollout."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.strict_route import _activate_watch, _bind_receipt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.discard(str(kb.kanban_db_path().resolve()))
+    with kb.connect() as conn:
+        def receipt(receipt_id, kind, payload):
+            return {
+                "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+                "kind": kind, "payload": payload,
+                "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                "current": True, "route_revision": "1",
+            }
+
+        admitted = kb.reconcile_strict_route(conn, {
+            "schema_version": "strict-route/v1", "request_id": "watcher-rollout",
+            "route": {"governing_board": "default", "governing_source_id": "watcher-rollout", "root_task_id": "root", "route_revision": "1", "requirements_digest": "requirements", "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False}},
+            "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "watcher/rollout/0"},
+            "receipts": [receipt("detector", "detector_source", {"source": "watcher-rollout"}), receipt("risk", "risk_classification", {"external": False, "credentials": False, "payment": False, "production_risk": False}), receipt("plan", "planning_materialization", {"plan": "watcher"})],
+        })
+        rollout = conn.execute(
+            "SELECT * FROM strict_route_candidates WHERE task_id=?",
+            (admitted.candidates["rollout.0"]["task_id"],),
+        ).fetchone()
+        with kb.write_txn(conn):
+            _activate_watch(conn, rollout)
+            _bind_receipt(
+                conn, rollout, "rollout_authority", {"authority": "test"},
+                purpose="rollout_authority",
+            )
+
+        manifests = _active_watch_runtime_manifests(conn)
+
+        assert len(manifests) == 1
+        assert manifests[0]["task_id"] == rollout["task_id"]
+        assert manifests[0]["route_id"] == admitted.route["route_id"]
+        assert manifests[0]["module_hashes"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM strict_route_candidate_receipts "
+            "WHERE candidate_id=? AND purpose='runtime_manifest'",
+            (rollout["candidate_id"],),
+        ).fetchone()[0] == 1

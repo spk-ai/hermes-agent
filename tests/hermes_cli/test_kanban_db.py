@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -4959,3 +4961,303 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# strict-route/v1 — opt-in native lifecycle contract (AA-159)
+# ---------------------------------------------------------------------------
+
+
+def _normal_strict_route_request():
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1",
+            "receipt_id": receipt_id,
+            "kind": kind,
+            "payload": payload,
+            "digest": hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "current": True,
+            "route_revision": "1",
+        }
+
+    return {
+        "schema_version": "strict-route/v1",
+        "request_id": "req-aa159",
+        "route": {
+            "governing_board": "default",
+            "governing_source_id": "detector-aa159",
+            "root_task_id": "root-aa159",
+            "route_revision": "1",
+            "requirements_digest": "requirements-sha256",
+            "external": False,
+            "credentials": False,
+            "payment": False,
+            "production_risk": False,
+        },
+        "stage": {
+            "key": "developer.0",
+            "kind": "developer",
+            "cycle": 0,
+            "idempotency_key": "aa159/developer/0",
+        },
+        "receipts": [
+            receipt("detector", "detector_source", {"source": "detector-aa159"}),
+            receipt("risk", "risk_classification", {
+                "external": False, "credentials": False, "payment": False,
+                "production_risk": False,
+            }),
+            receipt("plan", "planning_materialization", {"plan": "aa159"}),
+        ],
+    }
+
+
+def _developer_completion_metadata():
+    commit = {"sha": "a" * 40, "remote_ref": "origin/control/aa159"}
+    return {
+        "commit_sha": commit,
+        "baseline_sha": {
+            "baseline_sha": "b" * 40,
+            "descendant_sha": commit["sha"],
+            "is_ancestor": True,
+        },
+        "changed_files": {"paths": ["hermes_cli/kanban_db.py"]},
+        "focused_test_output": {
+            "command": "scripts/run_tests.sh tests/hermes_cli/test_kanban_db.py -q",
+            "output": "237 passed",
+            "exit_code": 0,
+        },
+        "full_test_output": {
+            "command": "scripts/run_tests.sh -q",
+            "output": "17000 passed",
+            "exit_code": 0,
+        },
+    }
+
+
+def test_strict_route_reconcile_is_idempotent_and_materializes_only_execution_link(kanban_home):
+    with kb.connect() as conn:
+        first = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+        second = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+
+        assert first.ok is True
+        assert second.ok is True
+        assert second.replayed is True
+        developer = first.candidates["developer.0"]
+        qa = first.candidates["qa.0"]
+        rollout = first.candidates["rollout.0"]
+        assert kb.get_task(conn, developer["task_id"]).status == "ready"
+        assert kb.get_task(conn, qa["task_id"]).status == "todo"
+        assert kb.get_task(conn, rollout["task_id"]).status == "blocked"
+        assert first.execution_links == [(developer["task_id"], qa["task_id"])]
+        assert first.active_watch["task_id"] == developer["task_id"]
+
+
+def test_strict_route_rejects_unsupported_gate_before_any_mutation(kanban_home):
+    request = _normal_strict_route_request()
+    request["stage"] = {
+        "key": "approval.0", "kind": "needs_input", "cycle": 0,
+        "idempotency_key": "aa159/approval/0",
+    }
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, request)
+        assert result.ok is False
+        assert result.refusal.code == "UNSUPPORTED_INTERNAL_APPROVAL"
+        assert kb.list_tasks(conn) == []
+
+
+def test_strict_route_refuses_noncurrent_nested_risk_receipt_before_any_mutation(kanban_home):
+    request = _normal_strict_route_request()
+    request["route"].pop("external")
+    request["route"].pop("credentials")
+    request["route"].pop("payment")
+    request["route"].pop("production_risk")
+    request["route"]["risk"] = {
+        "external": False,
+        "credentials": False,
+        "payment": False,
+        "production_risk": False,
+    }
+    request["receipts"][1]["current"] = False
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, request)
+
+        assert result.ok is False
+        assert result.refusal.code == "RECEIPT_NOT_CURRENT"
+        assert kb.list_tasks(conn) == []
+
+
+def test_strict_route_refuses_receipt_without_typed_currentness_or_matching_digest(kanban_home):
+    request = _normal_strict_route_request()
+    request["receipts"][0]["current"] = "yes"
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, request)
+        assert result.ok is False
+        assert result.refusal.code == "RECEIPT_NOT_CURRENT"
+        assert kb.list_tasks(conn) == []
+
+    request = _normal_strict_route_request()
+    request["receipts"][0]["digest"] = "not-the-payload-digest"
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, request)
+        assert result.ok is False
+        assert result.refusal.code == "RECEIPT_MISMATCH"
+        assert kb.list_tasks(conn) == []
+
+
+def test_strict_route_missing_completion_receipt_cannot_promote_qa_or_force_promote(kanban_home):
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+        developer = result.candidates["developer.0"]["task_id"]
+        qa = result.candidates["qa.0"]["task_id"]
+        assert kb.complete_task(conn, developer, summary="no receipt") is False
+        assert kb.get_task(conn, developer).status == "ready"
+        assert kb.get_task(conn, qa).status == "todo"
+        ok, reason = kb.promote_task(conn, qa, actor="tester", force=True)
+        assert ok is False
+        assert "MISSING_RECEIPT" in reason
+
+
+def test_strict_route_developer_completion_receipt_unlocks_only_qa(kanban_home):
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+        developer = result.candidates["developer.0"]["task_id"]
+        qa = result.candidates["qa.0"]["task_id"]
+        rollout = result.candidates["rollout.0"]["task_id"]
+
+        assert kb.complete_task(
+            conn,
+            developer,
+            summary="implementation receipt",
+            metadata=_developer_completion_metadata(),
+        ) is True
+
+        assert kb.get_task(conn, qa).status == "ready"
+        assert kb.get_task(conn, rollout).status == "blocked"
+        assert kb.is_current_eligible(conn, qa, "claim").allowed is True
+        assert kb.is_current_eligible(conn, rollout, "unblock").reason_code == "ROLLOUT_AUTHORITY_REQUIRED"
+
+
+def test_strict_route_completion_rejects_unstructured_or_inactive_receipts_before_binding(kanban_home):
+    with kb.connect() as conn:
+        admitted = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+        developer = admitted.candidates["developer.0"]["task_id"]
+        qa = admitted.candidates["qa.0"]["task_id"]
+
+        invalid = _developer_completion_metadata()
+        invalid["changed_files"] = ["hermes_cli/kanban_db.py"]
+        assert kb.complete_task(conn, developer, summary="legacy receipt", metadata=invalid) is False
+        developer_task = kb.get_task(conn, developer)
+        assert developer_task is not None
+        assert developer_task.status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM strict_route_candidate_receipts "
+            "WHERE candidate_id=? AND purpose='completion'",
+            (admitted.candidates["developer.0"]["candidate_id"],),
+        ).fetchone()["count"] == 0
+
+        assert kb.complete_task(
+            conn, developer, summary="valid receipt", metadata=_developer_completion_metadata(),
+        ) is True
+        assert kb.complete_task(
+            conn, developer, summary="stale receipt", metadata=_developer_completion_metadata(),
+        ) is False
+        qa_task = kb.get_task(conn, qa)
+        assert qa_task is not None
+        assert qa_task.status == "ready"
+
+
+def test_strict_route_external_receipts_require_permitted_purpose_and_current_watch(kanban_home):
+    with kb.connect() as conn:
+        admitted = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+        developer = admitted.candidates["developer.0"]
+        qa = admitted.candidates["qa.0"]
+        payload = _developer_completion_metadata()["commit_sha"]
+
+        def request(task_id, kind="implementation_commit", purpose="completion"):
+            return {
+                "schema_version": "strict-route/v1",
+                "request_id": "external-receipt",
+                "board": "default",
+                "task_id": task_id,
+                "receipt_kind": kind,
+                "receipt_purpose": purpose,
+                "payload": payload,
+                "immutable_digest": hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "issuer_witness": {
+                    "schema_version": "strict-route/v1",
+                    "receipt_id": "issuer-witness",
+                    "kind": kind,
+                    "payload": payload,
+                    "digest": hashlib.sha256(
+                        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "current": True,
+                    "route_revision": "1",
+                },
+            }
+
+        assert kb.record_strict_route_receipt(
+            conn, request(developer["task_id"], kind="arbitrary"),
+        ).reason_code == "RECEIPT_KIND_NOT_PERMITTED"
+        assert kb.record_strict_route_receipt(
+            conn, request(developer["task_id"], purpose="external"),
+        ).reason_code == "RECEIPT_PURPOSE_NOT_PERMITTED"
+        assert kb.record_strict_route_receipt(
+            conn, request(qa["task_id"]),
+        ).reason_code == "NOT_CURRENT_CANDIDATE"
+        assert kb.record_strict_route_receipt(conn, request(developer["task_id"])).allowed is True
+
+        conflicting = request(developer["task_id"])
+        conflicting["payload"] = {"sha": "a" * 40, "remote_ref": "origin/control/different"}
+        conflicting["immutable_digest"] = hashlib.sha256(
+            json.dumps(conflicting["payload"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        conflicting["issuer_witness"]["payload"] = conflicting["payload"]
+        conflicting["issuer_witness"]["digest"] = conflicting["immutable_digest"]
+        assert kb.record_strict_route_receipt(
+            conn, conflicting,
+        ).reason_code == "RECEIPT_IMMUTABLE_CONFLICT"
+
+
+def test_strict_route_qa_fail_materializes_one_repair_cycle(kanban_home):
+    with kb.connect() as conn:
+        result = kb.reconcile_strict_route(conn, _normal_strict_route_request())
+        developer = result.candidates["developer.0"]["task_id"]
+        qa = result.candidates["qa.0"]["task_id"]
+        assert kb.complete_task(
+            conn,
+            developer,
+            summary="implementation receipt",
+            metadata=_developer_completion_metadata(),
+        ) is True
+
+        assert kb.complete_task(
+            conn,
+            qa,
+            summary="independent QA failed",
+            metadata={
+                "verdict": "FAIL",
+                "fresh_hermes_home": "/tmp/qa-home",
+                "implementation_commit": _developer_completion_metadata()["commit_sha"],
+            },
+        ) is True
+
+        candidates = conn.execute(
+            "SELECT stage_key, task_id FROM strict_route_candidates ORDER BY stage_key"
+        ).fetchall()
+        by_stage = {row["stage_key"]: row["task_id"] for row in candidates}
+        assert {"developer.0", "qa.0", "developer.1", "qa.1", "rollout.0"} == set(by_stage)
+        assert kb.get_task(conn, by_stage["developer.1"]).status == "ready"
+        assert kb.get_task(conn, by_stage["qa.1"]).status == "todo"
+        assert kb.get_task(conn, by_stage["rollout.0"]).status == "blocked"
+        assert kb.is_current_eligible(conn, by_stage["developer.1"], "claim").allowed is True
+
+        # A second completion cannot create an unbounded repair chain.
+        assert kb.complete_task(conn, qa, summary="repeat", metadata={}) is False
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM strict_route_candidates WHERE stage_key LIKE 'developer.%'"
+        ).fetchone()["n"] == 2

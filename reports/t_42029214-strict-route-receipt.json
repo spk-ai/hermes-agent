@@ -1,0 +1,56 @@
+{
+  "schema_version": "strict-route/v1-implementation-receipt",
+  "task_id": "t_42029214",
+  "authority": "native_kanban",
+  "implementation_commit": "be9ced0fa332096819e700e8c65d2e60caaf11ac",
+  "baseline_commit": "e6b75a442",
+  "changed_paths": [
+    "gateway/kanban_watchers.py",
+    "hermes_cli/kanban.py",
+    "hermes_cli/kanban_db.py",
+    "hermes_cli/strict_route.py",
+    "plugins/kanban/dashboard/plugin_api.py",
+    "tools/kanban_tools.py",
+    "tests/gateway/test_kanban_watchers_mixin.py",
+    "tests/hermes_cli/test_kanban_core_functionality.py",
+    "tests/hermes_cli/test_kanban_db.py",
+    "tests/hermes_cli/test_kanban_promote.py",
+    "tests/hermes_cli/test_strict_route.py",
+    "tests/plugins/test_kanban_dashboard_plugin.py",
+    "tests/tools/test_kanban_tools.py"
+  ],
+  "invariants": [
+    "Strict route state is projected from native Kanban tables; it does not create a second lifecycle authority.",
+    "Admission is opt-in, schema-versioned, idempotent, and validates current immutable route receipts.",
+    "Lifecycle, dispatcher, recovery, and dashboard mutation paths consult native strict eligibility.",
+    "Generic task_links only model developer-to-QA scheduling; route identity and evidence live in strict-route projection tables.",
+    "Developer completion requires bound implementation evidence; QA failure can materialize one bounded repair cycle; rollout remains authority-gated."
+  ],
+  "verification": [
+    {
+      "command": "scripts/run_tests.sh tests/hermes_cli/test_strict_route.py -v",
+      "result": "passed",
+      "tests": 1
+    },
+    {
+      "command": "scripts/run_tests.sh tests/plugins/test_kanban_dashboard_plugin.py -k strict_route -v",
+      "result": "passed",
+      "tests": 2
+    },
+    {
+      "command": "scripts/run_tests.sh tests/hermes_cli/test_strict_route.py tests/hermes_cli/test_kanban_db.py tests/plugins/test_kanban_dashboard_plugin.py tests/tools/test_kanban_tools.py tests/gateway/test_kanban_watchers_mixin.py -v",
+      "result": "456 passed; 3 failed",
+      "note": "All strict-route, DB, tools, and watcher tests passed. The three dashboard home-channel failures are pre-existing/unrelated configuration leakage: google_chat was returned despite tests only clearing Telegram/Discord/Slack environment settings; strict-route dashboard tests pass in isolation."
+    },
+    {
+      "command": "git diff --check b74cb4123..HEAD",
+      "result": "passed"
+    }
+  ],
+  "handoff": {
+    "qa_required": true,
+    "rollout_performed": false,
+    "default_branch_merge_performed": false,
+    "pilot_performed": false
+  }
+}

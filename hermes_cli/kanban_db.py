@@ -1264,6 +1264,90 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Versioned, opt-in strict-route ledger. These rows deliberately do not
+-- overload task_links: links are scheduling prerequisites, while route
+-- identity, evidence, and watches are lifecycle authority records.
+CREATE TABLE IF NOT EXISTS strict_routes (
+    route_id TEXT PRIMARY KEY,
+    board_slug TEXT NOT NULL,
+    governing_source_id TEXT NOT NULL,
+    root_task_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (board_slug, governing_source_id, root_task_id)
+);
+CREATE TABLE IF NOT EXISTS strict_route_revisions (
+    revision_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL,
+    route_revision TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    requirements_digest TEXT NOT NULL,
+    risk_digest TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active',
+    created_at INTEGER NOT NULL,
+    superseded_at INTEGER,
+    UNIQUE (route_id, route_revision)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strict_route_one_active_revision
+    ON strict_route_revisions(route_id) WHERE state = 'active';
+CREATE TABLE IF NOT EXISTS strict_route_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    revision_id TEXT NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
+    stage_key TEXT NOT NULL,
+    stage_kind TEXT NOT NULL,
+    cycle INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active',
+    replacement_candidate_id TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (revision_id, stage_key),
+    UNIQUE (revision_id, idempotency_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strict_candidate_one_active_stage
+    ON strict_route_candidates(revision_id, stage_key) WHERE state = 'active';
+CREATE TABLE IF NOT EXISTS strict_route_receipts (
+    receipt_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    payload TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (revision_id, receipt_id, kind, digest)
+);
+CREATE TABLE IF NOT EXISTS strict_route_candidate_receipts (
+    candidate_id TEXT NOT NULL,
+    receipt_pk INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    PRIMARY KEY (candidate_id, receipt_pk, purpose)
+);
+CREATE TABLE IF NOT EXISTS strict_route_associations (
+    revision_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (revision_id, subject_type, subject_id, kind, target_type, target_id)
+);
+CREATE TABLE IF NOT EXISTS strict_route_watches (
+    watch_id TEXT PRIMARY KEY,
+    revision_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    route_digest TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    activated_at INTEGER NOT NULL,
+    deactivated_at INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strict_route_one_active_watch
+    ON strict_route_watches(revision_id) WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_strict_candidates_task ON strict_route_candidates(task_id);
+CREATE INDEX IF NOT EXISTS idx_strict_receipts_lookup ON strict_route_receipts(revision_id, kind, digest);
+CREATE INDEX IF NOT EXISTS idx_strict_watch_active ON strict_route_watches(revision_id, active);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2815,6 +2899,8 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
+        if is_current_eligible(conn, parent_id, "dashboard_link").strict or is_current_eligible(conn, child_id, "dashboard_link").strict:
+            raise ValueError("ASSOCIATION_NOT_EXECUTION_LINK: strict route links are materialized only by strict-route reconciliation")
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -3321,6 +3407,12 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            strict = is_current_eligible(conn, task_id, "recompute_ready")
+            if not strict.allowed:
+                _append_event(conn, task_id, "strict_eligibility_refused", {
+                    "operation": "recompute_ready", "reason_code": strict.reason_code,
+                })
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -3386,6 +3478,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        strict = is_current_eligible(conn, task_id, "claim")
+        if not strict.allowed:
+            _append_event(conn, task_id, "strict_eligibility_refused", {
+                "operation": "claim", "reason_code": strict.reason_code,
+            })
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3515,6 +3613,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        strict = is_current_eligible(conn, task_id, "claim_review")
+        if not strict.allowed:
+            _append_event(conn, task_id, "strict_eligibility_refused", {
+                "operation": "claim_review", "reason_code": strict.reason_code,
+            })
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -3639,6 +3743,13 @@ def release_stale_claims(
         (now,),
     ).fetchall()
     for row in stale:
+        strict = is_current_eligible(conn, row["id"], "release_stale")
+        if not strict.allowed:
+            with write_txn(conn):
+                _append_event(conn, row["id"], "strict_eligibility_refused", {
+                    "operation": "release_stale", "reason_code": strict.reason_code,
+                })
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -3762,6 +3873,13 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    strict = is_current_eligible(conn, task_id, "reclaim")
+    if not strict.allowed:
+        with write_txn(conn):
+            _append_event(conn, task_id, "strict_eligibility_refused", {
+                "operation": "reclaim", "reason_code": strict.reason_code,
+            })
+        return False
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
@@ -4051,6 +4169,24 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        receipt = record_completion_receipt(conn, task_id, metadata)
+        if not receipt.allowed:
+            _append_event(
+                conn, task_id, "strict_eligibility_refused",
+                {
+                    "operation": "complete",
+                    "reason_code": receipt.reason_code,
+                    "missing_receipt_kinds": list(receipt.missing_receipt_kinds),
+                },
+            )
+            return False
+        strict = is_current_eligible(conn, task_id, "complete")
+        if not strict.allowed:
+            _append_event(
+                conn, task_id, "strict_eligibility_refused",
+                {"operation": "complete", "reason_code": strict.reason_code},
+            )
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4088,6 +4224,7 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        advance_after_completion(conn, task_id)
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -4997,6 +5134,9 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
+    strict = is_current_eligible(conn, task_id, "promote")
+    if not strict.allowed:
+        return False, strict.reason_code or "OPERATION_NOT_ALLOWED"
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -5060,6 +5200,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        strict = is_current_eligible(conn, task_id, "unblock")
+        if not strict.allowed:
+            _append_event(conn, task_id, "strict_eligibility_refused", {
+                "operation": "unblock", "reason_code": strict.reason_code,
+            })
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -6351,6 +6497,13 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        strict = is_current_eligible(conn, tid, "timeout_recovery")
+        if not strict.allowed:
+            with write_txn(conn):
+                _append_event(conn, tid, "strict_eligibility_refused", {
+                    "operation": "timeout_recovery", "reason_code": strict.reason_code,
+                })
+            continue
         # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
@@ -6488,6 +6641,13 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+        strict = is_current_eligible(conn, tid, "release_stale")
+        if not strict.allowed:
+            with write_txn(conn):
+                _append_event(conn, tid, "strict_eligibility_refused", {
+                    "operation": "release_stale", "reason_code": strict.reason_code,
+                })
+            continue
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
@@ -6696,6 +6856,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if time.time() - started_at < grace:
                     continue
             if _pid_alive(row["worker_pid"]):
+                continue
+
+            strict = is_current_eligible(conn, row["id"], "crash_recovery")
+            if not strict.allowed:
+                _append_event(conn, row["id"], "strict_eligibility_refused", {
+                    "operation": "crash_recovery", "reason_code": strict.reason_code,
+                })
                 continue
 
             pid = int(row["worker_pid"])
@@ -7534,6 +7701,13 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
+        strict = is_current_eligible(conn, row["id"], "dispatch_enumerate")
+        if not strict.allowed:
+            with write_txn(conn):
+                _append_event(conn, row["id"], "strict_eligibility_refused", {
+                    "operation": "dispatch_enumerate", "reason_code": strict.reason_code,
+                })
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
@@ -7672,6 +7846,13 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
+            # Claiming is not the final authority boundary: a strict route can
+            # be superseded while its workspace resolves. Re-check directly
+            # before the process side effect.
+            strict = is_current_eligible(conn, claimed.id, "dispatch_spawn")
+            if not strict.allowed:
+                _record_spawn_failure(conn, claimed.id, strict.reason_code or "strict route refused")
+                continue
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
@@ -9133,3 +9314,17 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# Kept at module end: strict_route resolves the native transaction/event
+# helpers lazily, so this re-export adds no import-time lifecycle authority.
+from hermes_cli.strict_route import (  # noqa: E402
+    StrictEligibilityResult,
+    StrictRouteReconcileResult,
+    StrictRouteRefusal,
+    advance_after_completion,
+    is_current_eligible,
+    record_strict_route_receipt,
+    record_completion_receipt,
+    reconcile_strict_route,
+)

@@ -9,6 +9,7 @@ Direct-SQL setup is used to construct that state deterministically.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -56,6 +57,23 @@ def _stuck_todo(conn, *, parents_done=True, n_parents=1):
     return child_id, parent_ids
 
 
+def _strict_route_request():
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+            "kind": kind, "payload": payload,
+            "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "current": True, "route_revision": "1",
+        }
+
+    return {
+        "schema_version": "strict-route/v1", "request_id": "promote-strict",
+        "route": {"governing_board": "default", "governing_source_id": "promote", "root_task_id": "root", "route_revision": "1", "requirements_digest": "requirements", "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False}},
+        "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "promote/developer/0"},
+        "receipts": [receipt("detector", "detector_source", {"source": "promote"}), receipt("risk", "risk_classification", {"external": False, "credentials": False, "payment": False, "production_risk": False}), receipt("plan", "planning_materialization", {"plan": "promote"})],
+    }
+
+
 def test_promote_stuck_todo_succeeds(conn):
     child, _ = _stuck_todo(conn, parents_done=True)
     ok, err = kb.promote_task(conn, child, actor="tester")
@@ -79,6 +97,21 @@ def test_promote_with_force_bypasses_dependency_check(conn):
     )
     assert ok and err is None
     assert kb.get_task(conn, child).status == "ready"
+
+
+def test_promote_force_refuses_strict_qa_without_developer_receipts(conn):
+    """The generic recovery command cannot bypass the strict-route ledger."""
+    admitted = kb.reconcile_strict_route(conn, _strict_route_request())
+    qa = admitted.candidates["qa.0"]["task_id"]
+
+    ok, reason = kb.promote_task(conn, qa, actor="operator", force=True)
+
+    assert ok is False
+    assert reason is not None
+    assert "MISSING_RECEIPT" in reason
+    task = kb.get_task(conn, qa)
+    assert task is not None
+    assert task.status == "todo"
 
 
 def test_promote_emits_audit_event(conn):

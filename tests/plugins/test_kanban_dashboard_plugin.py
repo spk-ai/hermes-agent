@@ -7,6 +7,7 @@ REST surface without spinning up the whole dashboard.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import subprocess
@@ -113,6 +114,73 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_strict_route_endpoint_returns_typed_refusal_without_generic_task_write(client):
+    request = {
+        "schema_version": "strict-route/v1",
+        "request_id": "dashboard-invalid",
+        "route": {
+            "governing_board": "default",
+            "governing_source_id": "detector",
+            "root_task_id": "root",
+            "route_revision": "v1",
+            "requirements_digest": "digest",
+            "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False},
+        },
+        "stage": {"key": "needs_input.0", "kind": "needs_input", "cycle": 0, "idempotency_key": "bad"},
+        "receipts": [],
+    }
+
+    response = client.post("/api/plugins/kanban/strict-routes/reconcile", json={"request": request})
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["schema_version"] == "strict-route/v1"
+    assert detail["code"] == "UNSUPPORTED_INTERNAL_APPROVAL"
+    with kb.connect() as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_dashboard_direct_status_and_link_refuse_strict_route_candidates(client):
+    """Drag/drop and dependency controls cannot mutate strict execution state."""
+    request = {
+        "schema_version": "strict-route/v1",
+        "request_id": "dashboard-direct-controls",
+        "route": {
+            "governing_board": "default",
+            "governing_source_id": "dashboard",
+            "root_task_id": "dashboard-root",
+            "route_revision": "1",
+            "requirements_digest": "digest",
+            "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False},
+        },
+        "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "dashboard/developer/0"},
+        "receipts": [
+            {"schema_version": "strict-route/v1", "receipt_id": "detector", "kind": "detector_source", "payload": {"source": "dashboard"}, "digest": hashlib.sha256(b'{"source":"dashboard"}').hexdigest(), "current": True, "route_revision": "1"},
+            {"schema_version": "strict-route/v1", "receipt_id": "risk", "kind": "risk_classification", "payload": {"external": False, "credentials": False, "payment": False, "production_risk": False}, "digest": hashlib.sha256(b'{"credentials":false,"external":false,"payment":false,"production_risk":false}').hexdigest(), "current": True, "route_revision": "1"},
+            {"schema_version": "strict-route/v1", "receipt_id": "plan", "kind": "planning_materialization", "payload": {"plan": "dashboard"}, "digest": hashlib.sha256(b'{"plan":"dashboard"}').hexdigest(), "current": True, "route_revision": "1"},
+        ],
+    }
+    with kb.connect() as conn:
+        admitted = kb.reconcile_strict_route(conn, request)
+        developer = admitted.candidates["developer.0"]["task_id"]
+        qa = admitted.candidates["qa.0"]["task_id"]
+        ordinary = kb.create_task(conn, title="ordinary")
+
+    status_response = client.patch(
+        f"/api/plugins/kanban/tasks/{developer}", json={"status": "todo"},
+    )
+    link_response = client.post(
+        "/api/plugins/kanban/links", json={"parent_id": ordinary, "child_id": qa},
+    )
+
+    assert status_response.status_code == 409
+    assert link_response.status_code == 400
+    status_detail = status_response.json()["detail"]
+    assert status_detail["schema_version"] == "strict-route/v1"
+    assert status_detail["code"] == "OPERATION_NOT_ALLOWED"
+    assert "ASSOCIATION_NOT_EXECUTION_LINK" in link_response.json()["detail"]
 
 
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(

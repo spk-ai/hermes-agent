@@ -504,6 +504,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
 
+    p_strict_route = sub.add_parser(
+        "strict-route", help="Operate the opt-in strict-route/v1 ledger",
+    )
+    p_strict_route_sub = p_strict_route.add_subparsers(dest="strict_route_command")
+    p_strict_route_reconcile = p_strict_route_sub.add_parser(
+        "reconcile", help="Atomically reconcile a strict-route/v1 request",
+    )
+    p_strict_route_reconcile.add_argument(
+        "--request", required=True,
+        help="JSON strict-route/v1 request; output is JSON with canonical IDs or typed refusal",
+    )
+    p_strict_route_receipt = p_strict_route_sub.add_parser(
+        "record-receipt", help="Record one immutable strict-route/v1 receipt",
+    )
+    p_strict_route_receipt.add_argument(
+        "--request", required=True,
+        help="JSON strict-route/v1 receipt request; output is JSON with a typed refusal",
+    )
+
     # --- claim ---
     p_claim = sub.add_parser(
         "claim",
@@ -949,6 +968,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "diag":     _cmd_diagnostics,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
+            "strict-route": _cmd_strict_route,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
@@ -1299,6 +1319,59 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
         counts = entry["counts"] or {}
         count_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(idle)"
         print(f"{entry['name']:20s}  {on_disk:8s}  {count_str}")
+    return 0
+
+
+def _cmd_strict_route(args: argparse.Namespace) -> int:
+    command = getattr(args, "strict_route_command", None)
+    if command not in {"reconcile", "record-receipt"}:
+        print("kanban strict-route: expected 'reconcile' or 'record-receipt'", file=sys.stderr)
+        return 2
+    try:
+        request = json.loads(args.request)
+    except (TypeError, json.JSONDecodeError) as exc:
+        print(f"kanban strict-route: invalid JSON request: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(request, dict):
+        print("kanban strict-route: request must be a JSON object", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        if command == "record-receipt":
+            receipt = kb.record_strict_route_receipt(conn, request)
+            payload = {
+                "ok": receipt.allowed,
+                "schema_version": "strict-route/v1",
+                "task_id": receipt.task_id,
+                "route_id": receipt.route_id,
+                "candidate_id": receipt.candidate_id,
+            }
+            if not receipt.allowed:
+                payload["refusal"] = {"code": receipt.reason_code or "OPERATION_NOT_ALLOWED"}
+                print(json.dumps(payload, sort_keys=True))
+                return 1
+            print(json.dumps(payload, sort_keys=True))
+            return 0
+        result = kb.reconcile_strict_route(conn, request)
+    if not result.ok:
+        refusal = result.refusal
+        print(json.dumps({
+            "ok": False,
+            "refusal": {
+                "code": refusal.code if refusal else "OPERATION_NOT_ALLOWED",
+                "message": refusal.message if refusal else "strict route refused",
+                "request_id": refusal.request_id if refusal else request.get("request_id"),
+            },
+        }, sort_keys=True))
+        return 1
+    print(json.dumps({
+        "ok": True,
+        "replayed": result.replayed,
+        "route": result.route,
+        "candidates": result.candidates,
+        "execution_links": result.execution_links,
+        "active_watch": result.active_watch,
+        "cardinality": result.cardinality,
+    }, sort_keys=True))
     return 0
 
 

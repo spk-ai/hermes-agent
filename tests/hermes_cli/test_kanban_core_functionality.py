@@ -11,6 +11,7 @@ parity across every registered verb.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -49,6 +50,126 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     kb.init_db()
     return home
+
+
+def test_strict_route_rejects_direct_link_from_core_kernel(kanban_home):
+    """Direct kernel callers cannot turn strict evidence into task_links."""
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+            "kind": kind, "payload": payload,
+            "digest": hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "current": True, "route_revision": "1",
+        }
+
+    request = {
+        "schema_version": "strict-route/v1", "request_id": "core-link",
+        "route": {
+            "governing_board": "default", "governing_source_id": "source",
+            "root_task_id": "root", "route_revision": "1",
+            "requirements_digest": "digest",
+            "risk": {"external": False, "credentials": False, "payment": False, "production_risk": False},
+        },
+        "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "core/link"},
+        "receipts": [
+            receipt("source", "detector_source", {"source": "source"}),
+            receipt("risk", "risk_classification", {"external": False, "credentials": False, "payment": False, "production_risk": False}),
+            receipt("plan", "planning_materialization", {"plan": "core"}),
+        ],
+    }
+    conn = kb.connect()
+    try:
+        admitted = kb.reconcile_strict_route(conn, request)
+        developer = admitted.candidates["developer.0"]["task_id"]
+        qa = admitted.candidates["qa.0"]["task_id"]
+        with pytest.raises(ValueError, match="ASSOCIATION_NOT_EXECUTION_LINK"):
+            kb.link_tasks(conn, developer, qa)
+        assert kb.parent_ids(conn, qa) == [developer]
+    finally:
+        conn.close()
+
+
+def test_strict_route_rejects_duplicate_admission_receipt_before_mutation(kanban_home):
+    """Ambiguous admission evidence cannot create a later-unclaimable route."""
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+            "kind": kind, "payload": payload,
+            "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "current": True, "route_revision": "1",
+        }
+
+    risk = {"external": False, "credentials": False, "payment": False, "production_risk": False}
+    request = {
+        "schema_version": "strict-route/v1", "request_id": "duplicate-admission",
+        "route": {"governing_board": "default", "governing_source_id": "source", "root_task_id": "root", "route_revision": "1", "requirements_digest": "digest", "risk": risk},
+        "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "core/duplicate"},
+        "receipts": [receipt("source-a", "detector_source", {"source": "source"}), receipt("source-b", "detector_source", {"source": "source-b"}), receipt("risk", "risk_classification", risk), receipt("plan", "planning_materialization", {"plan": "core"})],
+    }
+    conn = kb.connect()
+    try:
+        result = kb.reconcile_strict_route(conn, request)
+        assert result.ok is False
+        assert result.refusal is not None
+        assert result.refusal.code == "RECEIPT_CARDINALITY_INVALID"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM strict_route_revisions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_strict_route_refuses_stale_crash_and_timeout_recovery(kanban_home, monkeypatch):
+    """Recovery cannot requeue a strict candidate after its identity is stale."""
+    import hermes_cli.kanban_db as _kb
+
+    def receipt(receipt_id, kind, payload):
+        return {
+            "schema_version": "strict-route/v1", "receipt_id": receipt_id,
+            "kind": kind, "payload": payload,
+            "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "current": True, "route_revision": "1",
+        }
+
+    risk = {"external": False, "credentials": False, "payment": False, "production_risk": False}
+    request = {
+        "schema_version": "strict-route/v1", "request_id": "recovery-refusal",
+        "route": {"governing_board": "default", "governing_source_id": "recovery", "root_task_id": "root", "route_revision": "1", "requirements_digest": "digest", "risk": risk},
+        "stage": {"key": "developer.0", "kind": "developer", "cycle": 0, "idempotency_key": "core/recovery"},
+        "receipts": [receipt("source", "detector_source", {"source": "recovery"}), receipt("risk", "risk_classification", risk), receipt("plan", "planning_materialization", {"plan": "core"})],
+    }
+    conn = kb.connect()
+    try:
+        admitted = kb.reconcile_strict_route(conn, request)
+        task_id = admitted.candidates["developer.0"]["task_id"]
+        assert kb.claim_task(conn, task_id) is not None
+        current_run = kb.latest_run(conn, task_id)
+        old = int(time.time()) - 60
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM strict_route_associations WHERE revision_id=("
+                "SELECT revision_id FROM strict_route_candidates WHERE task_id=?) "
+                "AND kind='risk_digest'",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET claim_expires=?, worker_pid=?, max_runtime_seconds=1 WHERE id=?",
+                (old, 999999, task_id),
+            )
+            conn.execute("UPDATE task_runs SET started_at=? WHERE id=?", (old, current_run.id))
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(conn) == 0
+        assert kb.detect_crashed_workers(conn) == []
+        assert kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None) == []
+        assert kb.get_task(conn, task_id).status == "running"
+        refused = [event for event in kb.list_events(conn, task_id) if event.kind == "strict_eligibility_refused"]
+        assert {event.payload["operation"] for event in refused} >= {
+            "release_stale", "crash_recovery", "timeout_recovery",
+        }
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
