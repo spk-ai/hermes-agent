@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,19 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _request() -> dict:
+    def receipt(receipt_id: str, kind: str, payload: dict) -> dict:
+        return {
+            "schema_version": "strict-route/v1",
+            "receipt_id": receipt_id,
+            "kind": kind,
+            "digest": hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "current": True,
+            "route_revision": "v1",
+            "payload": payload,
+        }
+
     return {
         "schema_version": "strict-route/v1",
         "request_id": "strict-route-native-authority",
@@ -43,32 +58,18 @@ def _request() -> dict:
             "idempotency_key": "route/developer/0",
         },
         "receipts": [
-            {
-                "receipt_id": "detector",
-                "kind": "detector_source",
-                "digest": "detector-digest",
-                "current": True,
-                "payload": {"source": "detector-source"},
-            },
-            {
-                "receipt_id": "risk",
-                "kind": "risk_classification",
-                "digest": "risk-digest",
-                "current": True,
-                "payload": {
+            receipt("detector", "detector_source", {"source": "detector-source"}),
+            receipt(
+                "risk",
+                "risk_classification",
+                {
                     "external": False,
                     "credentials": False,
                     "payment": False,
                     "production_risk": False,
                 },
-            },
-            {
-                "receipt_id": "plan",
-                "kind": "planning_materialization",
-                "digest": "plan-digest",
-                "current": True,
-                "payload": {"plan": "immutable"},
-            },
+            ),
+            receipt("plan", "planning_materialization", {"plan": "immutable"}),
         ],
     }
 
